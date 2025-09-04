@@ -16,6 +16,7 @@ import pccm
 from ccimport import compat
 from cumm.common import TensorView
 
+
 class OMPLib(pccm.Class):
     def __init__(self):
         super().__init__()
@@ -23,6 +24,12 @@ class OMPLib(pccm.Class):
         self.add_include("tensorview/parallel/all.h")
         if compat.InWindows:
             self.build_meta.add_public_cflags("cl", "/openmp")
+
+        # TODO: Use OpenMP in macOS
+        elif compat.InMacOS:
+            self.build_meta.add_public_cflags("g++")
+            self.build_meta.add_public_cflags("clang++")
+            self.build_meta.add_ldflags("g++,clang++")
         else:
             self.build_meta.add_public_cflags("g++", "-fopenmp")
             self.build_meta.add_public_cflags("clang++", "-fopenmp")
