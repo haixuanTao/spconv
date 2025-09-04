@@ -146,6 +146,8 @@ class SparseConvolutionBase:
             act_type: tv.gemm.Activation = tv.gemm.Activation.None_,
             act_alpha: float = 0,
             act_beta: float = 0):
+        if CPU_ONLY_BUILD:
+            input._timer = None
         # assert isinstance(input, SparseConvTensor)
         is_int8 = input.is_quantized and weight.is_quantized
         if is_int8:
