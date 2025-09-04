@@ -12,12 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from pathlib import Path
-from typing import List
 
 import pccm
 from pccm.utils import project_is_editable, project_is_installed
-from ccimport.compat import InWindows
+from ccimport.compat import InMacOS
 from .constants import PACKAGE_NAME, PACKAGE_ROOT, DISABLE_JIT, SPCONV_INT8_DEBUG
 
 if project_is_installed(PACKAGE_NAME) and project_is_editable(
@@ -54,19 +52,31 @@ if project_is_installed(PACKAGE_NAME) and project_is_editable(
     convops = ConvGemmOps(gemmtuner, convtuner)
     convops.namespace = "csrc.sparse.convops.spops"
 
-    cus = [
-        cu, convcu, gemmtuner, convtuner,
-        convops,
-        SpconvOps(),
-        BoxOps(),
-        HashTable(),
-        CompileInfo(),
-        ExternalAllocator(),
-        ExternalSpconvMatmul(),
-        SimpleExternalSpconvMatmul(), # for debug, won't be included in release
-        InferenceOps(),
-        PointCloudCompress(),
-    ]
+    if InMacOS:
+        cus = [
+            SpconvOps(),
+            BoxOps(),
+            HashTable(),
+            CompileInfo(),
+            ExternalAllocator(),
+            ExternalSpconvMatmul(),
+            InferenceOps(),
+            PointCloudCompress(),
+        ] 
+    else:   
+        cus = [
+            cu, convcu, gemmtuner, convtuner,
+            convops,
+            SpconvOps(),
+            BoxOps(),
+            HashTable(),
+            CompileInfo(),
+            ExternalAllocator(),
+            ExternalSpconvMatmul(),
+            SimpleExternalSpconvMatmul(), # for debug, won't be included in release
+            InferenceOps(),
+            PointCloudCompress(),
+        ]
     pccm.builder.build_pybind(cus,
                               PACKAGE_ROOT / "core_cc",
                               namespace_root=PACKAGE_ROOT,
