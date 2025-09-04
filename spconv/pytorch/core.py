@@ -12,18 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any, List, Optional, Tuple, TypeVar, Union, Dict
+from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
+
+from spconv.constants import SPCONV_FX_TRACE_MODE
 from spconv.core import ConvAlgo
 from spconv.pytorch.constants import PYTORCH_VERSION
-from spconv.tools import CUDAKernelTimer
-from spconv.constants import SPCONV_FX_TRACE_MODE
 
 if PYTORCH_VERSION >= [1, 8, 0]:
     try:
         import torch.fx
+
         if PYTORCH_VERSION >= [1, 10, 0]:
             from torch.fx import ProxyableClassMeta
         else:
@@ -58,10 +59,22 @@ class ThrustSortAllocator:
 
 
 class IndiceData(object):
-    def __init__(self, out_indices, indices, indice_pairs, indice_pair_num,
-                 spatial_shape, out_spatial_shape, is_subm: bool, algo: ConvAlgo,
-                 ksize: List[int], stride: List[int], dilation: List[int], padding: List[int],
-                 voxel_num: Optional[Any] = None):
+    def __init__(
+        self,
+        out_indices,
+        indices,
+        indice_pairs,
+        indice_pair_num,
+        spatial_shape,
+        out_spatial_shape,
+        is_subm: bool,
+        algo: ConvAlgo,
+        ksize: List[int],
+        stride: List[int],
+        dilation: List[int],
+        padding: List[int],
+        voxel_num: Optional[Any] = None,
+    ):
         self.out_indices = out_indices
         self.indices = indices
         self.indice_pairs = indice_pairs
@@ -79,17 +92,28 @@ class IndiceData(object):
 
 
 class ImplicitGemmIndiceData(object):
-    def __init__(self, out_indices: torch.Tensor, indices: torch.Tensor,
-                 pair_fwd: torch.Tensor, pair_bwd: torch.Tensor,
-                 pair_mask_fwd_splits: List[torch.Tensor],
-                 pair_mask_bwd_splits: List[torch.Tensor],
-                 mask_argsort_fwd_splits: List[torch.Tensor],
-                 mask_argsort_bwd_splits: List[torch.Tensor],
-                 masks: List[np.ndarray], spatial_shape, 
-                 out_spatial_shape, is_subm: bool, algo: ConvAlgo,
-                 ksize: List[int], stride: List[int], dilation: List[int], padding: List[int],
-                 in_voxel_num: Optional[Any] = None,
-                 out_voxel_num: Optional[Any] = None):
+    def __init__(
+        self,
+        out_indices: torch.Tensor,
+        indices: torch.Tensor,
+        pair_fwd: torch.Tensor,
+        pair_bwd: torch.Tensor,
+        pair_mask_fwd_splits: List[torch.Tensor],
+        pair_mask_bwd_splits: List[torch.Tensor],
+        mask_argsort_fwd_splits: List[torch.Tensor],
+        mask_argsort_bwd_splits: List[torch.Tensor],
+        masks: List[np.ndarray],
+        spatial_shape,
+        out_spatial_shape,
+        is_subm: bool,
+        algo: ConvAlgo,
+        ksize: List[int],
+        stride: List[int],
+        dilation: List[int],
+        padding: List[int],
+        in_voxel_num: Optional[Any] = None,
+        out_voxel_num: Optional[Any] = None,
+    ):
         self.out_indices = out_indices
         self.indices = indices
         self.pair_fwd = pair_fwd
@@ -120,7 +144,7 @@ def scatter_nd(indices, updates, shape):
     """
     ret = torch.zeros(*shape, dtype=updates.dtype, device=updates.device)
     ndim = indices.shape[-1]
-    output_shape = list(indices.shape[:-1]) + shape[indices.shape[-1]:]
+    output_shape = list(indices.shape[:-1]) + shape[indices.shape[-1] :]
     flatted_indices = indices.view(-1, ndim)
     slices = [flatted_indices[:, i] for i in range(ndim)]
     slices += [Ellipsis]
@@ -130,18 +154,20 @@ def scatter_nd(indices, updates, shape):
 
 # ProxyableClassMeta is used for torch.fx
 class SparseConvTensor(metaclass=SpConvTensorMeta):
-    def __init__(self,
-                 features: torch.Tensor,
-                 indices: torch.Tensor,
-                 spatial_shape: Union[List[int], np.ndarray],
-                 batch_size: int,
-                 grid: Optional[torch.Tensor] = None,
-                 voxel_num: Optional[torch.Tensor] = None,
-                 indice_dict: Optional[dict] = None,
-                 benchmark: bool = False,
-                 permanent_thrust_allocator: bool = False,
-                 enable_timer: bool = False,
-                 force_algo: Optional[ConvAlgo] = None):
+    def __init__(
+        self,
+        features: torch.Tensor,
+        indices: torch.Tensor,
+        spatial_shape: Union[List[int], np.ndarray],
+        batch_size: int,
+        grid: Optional[torch.Tensor] = None,
+        voxel_num: Optional[torch.Tensor] = None,
+        indice_dict: Optional[dict] = None,
+        benchmark: bool = False,
+        permanent_thrust_allocator: bool = False,
+        enable_timer: bool = False,
+        force_algo: Optional[ConvAlgo] = None,
+    ):
         """
         Args:
             features: [num_points, num_features] feature tensor
@@ -179,7 +205,9 @@ class SparseConvTensor(metaclass=SpConvTensorMeta):
         self.thrust_allocator: Optional[ThrustSortAllocator] = None
         if permanent_thrust_allocator:
             self.thrust_allocator = ThrustSortAllocator(features.device)
-        self._timer = CUDAKernelTimer(enable_timer)
+
+        if CPU_ONLY_BUILD:
+            input._timer = None
         self.force_algo = force_algo
         self.int8_scale: Optional[np.ndarray] = None
 
@@ -200,9 +228,15 @@ class SparseConvTensor(metaclass=SpConvTensorMeta):
         due to limit of torch.fx
         """
         # assert feature.shape[0] == self.indices.shape[0], "replaced num of features not equal to indices"
-        new_spt = SparseConvTensor(feature, self.indices, self.spatial_shape,
-                                   self.batch_size, self.grid, self.voxel_num,
-                                   self.indice_dict)
+        new_spt = SparseConvTensor(
+            feature,
+            self.indices,
+            self.spatial_shape,
+            self.batch_size,
+            self.grid,
+            self.voxel_num,
+            self.indice_dict,
+        )
         new_spt.benchmark = self.benchmark
         new_spt.benchmark_record = self.benchmark_record
         new_spt.thrust_allocator = self.thrust_allocator
@@ -223,7 +257,8 @@ class SparseConvTensor(metaclass=SpConvTensorMeta):
     def features(self, val):
         msg = (
             "you can't set feature directly, use 'x = x.replace_feature(your_new_feature)'"
-            " to generate new SparseConvTensor instead.")
+            " to generate new SparseConvTensor instead."
+        )
         raise ValueError(msg)
 
     @classmethod
@@ -246,7 +281,8 @@ class SparseConvTensor(metaclass=SpConvTensorMeta):
         return np.prod(self.spatial_shape)
 
     def find_indice_pair(
-            self, key) -> Optional[Union[IndiceData, ImplicitGemmIndiceData]]:
+        self, key
+    ) -> Optional[Union[IndiceData, ImplicitGemmIndiceData]]:
         if key is None:
             return None
         if key in self.indice_dict:
@@ -254,11 +290,12 @@ class SparseConvTensor(metaclass=SpConvTensorMeta):
         return None
 
     def dense(self, channels_first: bool = True):
-        output_shape = [self.batch_size] + list(
-            self.spatial_shape) + [self.features.shape[1]]
+        output_shape = (
+            [self.batch_size] + list(self.spatial_shape) + [self.features.shape[1]]
+        )
         res = scatter_nd(
-            self.indices.to(self.features.device).long(), self.features,
-            output_shape)
+            self.indices.to(self.features.device).long(), self.features, output_shape
+        )
         if not channels_first:
             return res
         ndim = len(self.spatial_shape)
@@ -288,7 +325,7 @@ class SparseConvTensor(metaclass=SpConvTensorMeta):
             other_features = other.features
         self.features += other_features
         return self
-        
+
     def __radd__(self, other: Union["SparseConvTensor", torch.Tensor]):
         assert isinstance(other, (SparseConvTensor, torch.Tensor))
         if isinstance(other, torch.Tensor):
@@ -299,20 +336,29 @@ class SparseConvTensor(metaclass=SpConvTensorMeta):
 
     def shadow_copy(self) -> "SparseConvTensor":
         """create a new spconv tensor with all member unchanged"""
-        tensor = SparseConvTensor(self.features, self.indices,
-                                  self.spatial_shape, self.batch_size,
-                                  self.grid, self.voxel_num, self.indice_dict,
-                                  self.benchmark)
+        tensor = SparseConvTensor(
+            self.features,
+            self.indices,
+            self.spatial_shape,
+            self.batch_size,
+            self.grid,
+            self.voxel_num,
+            self.indice_dict,
+            self.benchmark,
+        )
         tensor.benchmark_record = self.benchmark_record
         tensor.thrust_allocator = self.thrust_allocator
-        tensor._timer = self._timer
+        tensor._timer = None
         tensor.force_algo = self.force_algo
         tensor.int8_scale = self.int8_scale
         return tensor
 
-def expand_nd(ndim: int, val: Union[int, List[int], Tuple[int, ...], np.ndarray]) -> List[int]:
+
+def expand_nd(
+    ndim: int, val: Union[int, List[int], Tuple[int, ...], np.ndarray]
+) -> List[int]:
     if isinstance(val, int):
-        res = [val] * ndim 
+        res = [val] * ndim
     elif isinstance(val, tuple):
         res = list(val)
     elif isinstance(val, np.ndarray):
@@ -320,4 +366,4 @@ def expand_nd(ndim: int, val: Union[int, List[int], Tuple[int, ...], np.ndarray]
     else:
         res = val
     assert len(res) == ndim
-    return [int(v) for v in res] 
+    return [int(v) for v in res]

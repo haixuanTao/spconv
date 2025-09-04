@@ -12,40 +12,55 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
-from enum import Enum
+from typing import List, Optional
+
+import numpy as np
+import torch
 from cumm import tensorview as tv
 from cumm.conv.bases import KRSC, NHWC, ConvOpType
 from cumm.gemm.algospec.core import ShuffleStrideType
+from cumm.gemm.codeops import div_up
 
-import torch
-import numpy as np
-import spconv
+from spconv.constants import (
+    SPCONV_CPP_GEMM,
+    SPCONV_CPP_INDICE_PAIRS,
+    SPCONV_CPP_INDICE_PAIRS_IGEMM,
+    SPCONV_DIRECT_TABLE_HASH_SIZE_SCALE,
+    SPCONV_DO_SORT,
+)
 from spconv.core import AlgoHint, ConvAlgo
-from typing import Dict, List, Optional, Union
-from spconv.pytorch.core import ThrustSortAllocator
-from spconv.pytorch.cppcore import _TORCH_DTYPE_TO_TV, TorchAllocator, torch_tensor_to_tv, get_current_stream, get_arch, TorchSpconvMatmul
 from spconv.core_cc.csrc.sparse.all import SpconvOps
-from spconv.core_cc.csrc.sparse.alloc import ExternalAllocator
-from spconv.constants import SPCONV_CPP_INDICE_PAIRS, SPCONV_CPP_INDICE_PAIRS_IGEMM, SPCONV_CPP_GEMM, SPCONV_DIRECT_TABLE_HASH_SIZE_SCALE, SPCONV_ALLOW_TF32, SPCONV_DO_SORT
-import spconv.core_cc as _ext
-from spconv.core_cc.csrc.sparse.convops.spops import ConvGemmOps
+
+# from spconv.core_cc.csrc.sparse.convops.spops import ConvGemmOps
 from spconv.core_cc.csrc.sparse.inference import InferenceOps
 from spconv.cppconstants import CPU_ONLY_BUILD
-from cumm.gemm.codeops import div_up
-from spconv.utils import nullcontext
+from spconv.pytorch.core import ThrustSortAllocator
+from spconv.pytorch.cppcore import (
+    _TORCH_DTYPE_TO_TV,
+    TorchAllocator,
+    TorchSpconvMatmul,
+    get_arch,
+    get_current_stream,
+    torch_tensor_to_tv,
+)
 
 if not CPU_ONLY_BUILD:
-    from spconv.algo import GEMM, CONV, GEMM_CPP, CONV_CPP
+    from spconv.algo import CONV, CONV_CPP, GEMM, GEMM_CPP
 else:
     GEMM = None
     CONV = None
     GEMM_CPP = None
     CONV_CPP = None
-import time
-from spconv.constants import FILTER_HWIO, ALL_WEIGHT_IS_KRSC, AllocKeys, SPCONV_USE_DIRECT_TABLE
 from cumm.gemm import codeops
-from spconv.tools import CUDAKernelTimer
+
 from spconv import constants
+from spconv.constants import (
+    ALL_WEIGHT_IS_KRSC,
+    FILTER_HWIO,
+    SPCONV_USE_DIRECT_TABLE,
+    AllocKeys,
+)
+from spconv.tools import CUDAKernelTimer
 
 DEBUG = False
 DEBUG_INT64_HASH_K = False
@@ -74,8 +89,9 @@ def get_conv_output_size(input_size, kernel_size, stride, padding, dilation):
     ndim = len(input_size)
     output_size = []
     for i in range(ndim):
-        size = (input_size[i] + 2 * padding[i] - dilation[i] *
-                (kernel_size[i] - 1) - 1) // stride[i] + 1
+        size = (
+            input_size[i] + 2 * padding[i] - dilation[i] * (kernel_size[i] - 1) - 1
+        ) // stride[i] + 1
         if kernel_size[i] == -1:
             output_size.append(1)
         else:
@@ -83,43 +99,47 @@ def get_conv_output_size(input_size, kernel_size, stride, padding, dilation):
     return output_size
 
 
-def get_deconv_output_size(input_size, kernel_size, stride, padding, dilation,
-                           output_padding):
+def get_deconv_output_size(
+    input_size, kernel_size, stride, padding, dilation, output_padding
+):
     ndim = len(input_size)
     output_size = []
     for i in range(ndim):
         if kernel_size[i] == -1:
             raise ValueError("deconv don't support kernel_size < 0")
-        size = (input_size[i] - 1) * stride[i] - 2 * padding[i] + kernel_size[
-            i] + output_padding[i]
+        size = (
+            (input_size[i] - 1) * stride[i]
+            - 2 * padding[i]
+            + kernel_size[i]
+            + output_padding[i]
+        )
         output_size.append(size)
     return output_size
 
 
 class _HashData:
-
-    def __init__(self,
-                 num: int,
-                 use_i64: bool,
-                 device: torch.device,
-                 rate: float = 2.0) -> None:
+    def __init__(
+        self, num: int, use_i64: bool, device: torch.device, rate: float = 2.0
+    ) -> None:
         if use_i64:
-            self.hashdata_k = torch.empty((int(num * rate), ),
-                                          dtype=torch.int64,
-                                          device=device)
-            self.hashdata_v = torch.empty((int(num * rate), ),
-                                          dtype=torch.int32,
-                                          device=device)
+            self.hashdata_k = torch.empty(
+                (int(num * rate),), dtype=torch.int64, device=device
+            )
+            self.hashdata_v = torch.empty(
+                (int(num * rate),), dtype=torch.int32, device=device
+            )
             self.hashdata_k_tv = torch_tensor_to_tv(self.hashdata_k)
             self.hashdata_v_tv = torch_tensor_to_tv(self.hashdata_v)
 
         else:
-            self.hashdata = torch.empty((
-                2,
-                int(num * rate),
-            ),
-                                        dtype=torch.int32,
-                                        device=device)
+            self.hashdata = torch.empty(
+                (
+                    2,
+                    int(num * rate),
+                ),
+                dtype=torch.int32,
+                device=device,
+            )
             hashdata_tv = torch_tensor_to_tv(self.hashdata)
             if num == 0:
                 self.hashdata_k_tv = tv.Tensor()
@@ -129,18 +149,20 @@ class _HashData:
                 self.hashdata_v_tv = hashdata_tv[1]
 
 
-def get_indice_pairs(indices: torch.Tensor,
-                     batch_size: int,
-                     spatial_shape: List[int],
-                     algo: ConvAlgo,
-                     ksize: List[int],
-                     stride: List[int],
-                     padding: List[int],
-                     dilation: List[int],
-                     out_padding: List[int],
-                     subm: bool = False,
-                     transpose: bool = False,
-                     num_out_act_bound: int = -1):
+def get_indice_pairs(
+    indices: torch.Tensor,
+    batch_size: int,
+    spatial_shape: List[int],
+    algo: ConvAlgo,
+    ksize: List[int],
+    stride: List[int],
+    padding: List[int],
+    dilation: List[int],
+    out_padding: List[int],
+    subm: bool = False,
+    transpose: bool = False,
+    num_out_act_bound: int = -1,
+):
     # torch.cuda.synchronize()
     # t = time.time()
     # stream = get_current_stream()
@@ -153,13 +175,21 @@ def get_indice_pairs(indices: torch.Tensor,
         if indices.is_cuda:
             stream = get_current_stream()
 
-        num_act_out = SpconvOps.get_indice_pairs(alloc,
-                                                 torch_tensor_to_tv(indices),
-                                                 batch_size, spatial_shape,
-                                                 algo.value, ksize, stride,
-                                                 padding, dilation,
-                                                 out_padding, subm, transpose,
-                                                 stream)
+        num_act_out = SpconvOps.get_indice_pairs(
+            alloc,
+            torch_tensor_to_tv(indices),
+            batch_size,
+            spatial_shape,
+            algo.value,
+            ksize,
+            stride,
+            padding,
+            dilation,
+            out_padding,
+            subm,
+            transpose,
+            stream,
+        )
         if subm:
             out_inds = indices
         else:
@@ -172,11 +202,13 @@ def get_indice_pairs(indices: torch.Tensor,
     kv: int = functools.reduce(lambda x, y: x * y, ksize, 1)
     if not subm:
         if transpose:
-            out_shape = get_deconv_output_size(spatial_shape, ksize, stride,
-                                               padding, dilation, out_padding)
+            out_shape = get_deconv_output_size(
+                spatial_shape, ksize, stride, padding, dilation, out_padding
+            )
         else:
-            out_shape = get_conv_output_size(spatial_shape, ksize, stride,
-                                             padding, dilation)
+            out_shape = get_conv_output_size(
+                spatial_shape, ksize, stride, padding, dilation
+            )
     else:
         out_shape = spatial_shape
     if any([x == 0 for x in out_shape]):
@@ -188,13 +220,10 @@ def get_indice_pairs(indices: torch.Tensor,
     spatial_volume = functools.reduce(lambda x, y: x * y, out_shape, 1) * batch_size
     use_int64_hash_k = spatial_volume >= INT32_MAX or DEBUG_INT64_HASH_K
     indice_dtype = torch.int64 if use_int64_hash_k else indices.dtype
-    pair = torch.full((2, kv, indices.shape[0]),
-                      -1,
-                      dtype=indices.dtype,
-                      device=indices.device)
-    indice_num_per_loc = torch.zeros((kv, ),
-                                     dtype=indices.dtype,
-                                     device=indices.device)
+    pair = torch.full(
+        (2, kv, indices.shape[0]), -1, dtype=indices.dtype, device=indices.device
+    )
+    indice_num_per_loc = torch.zeros((kv,), dtype=indices.dtype, device=indices.device)
 
     inds_tv = torch_tensor_to_tv(indices)
     pair_tv = torch_tensor_to_tv(pair)
@@ -203,62 +232,69 @@ def get_indice_pairs(indices: torch.Tensor,
         out_inds = indices
         if indices.is_cuda:
             stream = get_current_stream()
-            hashdata = _HashData(out_inds.shape[0], use_int64_hash_k,
-                                 indices.device)
+            hashdata = _HashData(out_inds.shape[0], use_int64_hash_k, indices.device)
             # hashdata = torch.empty((out_inds.shape[0] * 2, ),
             #                        dtype=torch.int64,
             #                        device=indices.device)
             out_inds_tv = torch_tensor_to_tv(out_inds)
             # hashdata_tv = torch_tensor_to_tv(hashdata, dtype=tv.custom64)
-            SpconvOps.generate_subm_conv_inds(inds_tv,
-                                              hashdata.hashdata_k_tv,
-                                              hashdata.hashdata_v_tv,
-                                              pair_tv,
-                                              out_inds_tv,
-                                              indice_num_per_loc_tv,
-                                              batch_size=batch_size,
-                                              input_dims=spatial_shape,
-                                              ksize=ksize,
-                                              dilation=dilation,
-                                              stream_int=stream)
+            SpconvOps.generate_subm_conv_inds(
+                inds_tv,
+                hashdata.hashdata_k_tv,
+                hashdata.hashdata_v_tv,
+                pair_tv,
+                out_inds_tv,
+                indice_num_per_loc_tv,
+                batch_size=batch_size,
+                input_dims=spatial_shape,
+                ksize=ksize,
+                dilation=dilation,
+                stream_int=stream,
+            )
         else:
             out_inds_tv = torch_tensor_to_tv(out_inds)
-            SpconvOps.generate_subm_conv_inds_cpu(inds_tv,
-                                                  pair_tv,
-                                                  out_inds_tv,
-                                                  indice_num_per_loc_tv,
-                                                  batch_size=batch_size,
-                                                  input_dims=spatial_shape,
-                                                  ksize=ksize,
-                                                  dilation=dilation)
+            SpconvOps.generate_subm_conv_inds_cpu(
+                inds_tv,
+                pair_tv,
+                out_inds_tv,
+                indice_num_per_loc_tv,
+                batch_size=batch_size,
+                input_dims=spatial_shape,
+                ksize=ksize,
+                dilation=dilation,
+            )
         # CONV.stream_synchronize(stream)
         # print("SUBM", time.time() - t)
 
     else:
         if indices.is_cuda:
             stream = get_current_stream()
-            indice_pairs_uniq = torch.empty((pair.numel() // 2 + 1, ),
-                                            dtype=indice_dtype,
-                                            device=indices.device)
+            indice_pairs_uniq = torch.empty(
+                (pair.numel() // 2 + 1,), dtype=indice_dtype, device=indices.device
+            )
             indice_pairs_uniq_tv = torch_tensor_to_tv(indice_pairs_uniq)
 
-            SpconvOps.generate_conv_inds_stage1(inds_tv,
-                                                pair_tv,
-                                                indice_pairs_uniq_tv,
-                                                indice_num_per_loc_tv,
-                                                batch_size=batch_size,
-                                                output_dims=out_shape,
-                                                input_dims=spatial_shape,
-                                                ksize=ksize,
-                                                stride=stride,
-                                                padding=padding,
-                                                dilation=dilation,
-                                                transposed=transpose,
-                                                stream_int=stream)
+            SpconvOps.generate_conv_inds_stage1(
+                inds_tv,
+                pair_tv,
+                indice_pairs_uniq_tv,
+                indice_num_per_loc_tv,
+                batch_size=batch_size,
+                output_dims=out_shape,
+                input_dims=spatial_shape,
+                ksize=ksize,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                transposed=transpose,
+                stream_int=stream,
+            )
             uniq_res = indice_pairs_uniq.unique()
             num_act_out = uniq_res.shape[0] - 1
-            if (num_act_out == 0):
-                msg = _POINT_VANISH_MSG.format(spatial_shape, ksize, stride, padding, dilation)
+            if num_act_out == 0:
+                msg = _POINT_VANISH_MSG.format(
+                    spatial_shape, ksize, stride, padding, dilation
+                )
                 raise ValueError(msg)
             use_bound_algo = False
             if num_out_act_bound > 0 and num_act_out > num_out_act_bound:
@@ -271,40 +307,45 @@ def get_indice_pairs(indices: torch.Tensor,
             #     uniq_size=indice_pairs_uniq_tv.size,
             #     stream_int=stream)
             # uniq_res_tv = indice_pairs_uniq_tv.slice_first_axis(0, num_act_out)
-            out_inds = torch.empty((num_act_out, indices.shape[1]),
-                                   dtype=indices.dtype,
-                                   device=indices.device)
+            out_inds = torch.empty(
+                (num_act_out, indices.shape[1]),
+                dtype=indices.dtype,
+                device=indices.device,
+            )
             # hashdata = torch.empty((out_inds.shape[0] * 2, ),
             #                        dtype=torch.int64,
             #                        device=indices.device)
-            hashdata = _HashData(out_inds.shape[0], use_int64_hash_k,
-                                 indices.device)
+            hashdata = _HashData(out_inds.shape[0], use_int64_hash_k, indices.device)
 
             out_inds_tv = torch_tensor_to_tv(out_inds)
             # hashdata_tv = torch_tensor_to_tv(hashdata, dtype=tv.custom64)
-            SpconvOps.generate_conv_inds_stage2(inds_tv,
-                                                hashdata.hashdata_k_tv,
-                                                hashdata.hashdata_v_tv,
-                                                pair_tv,
-                                                uniq_res_tv,
-                                                indice_pairs_uniq_tv,
-                                                out_inds_tv,
-                                                indice_num_per_loc_tv,
-                                                num_out_act=num_act_out,
-                                                batch_size=batch_size,
-                                                output_dims=out_shape,
-                                                input_dims=spatial_shape,
-                                                ksize=ksize,
-                                                stride=stride,
-                                                padding=padding,
-                                                dilation=dilation,
-                                                transposed=transpose,
-                                                stream_int=stream,
-                                                use_bound_algo=use_bound_algo)
+            SpconvOps.generate_conv_inds_stage2(
+                inds_tv,
+                hashdata.hashdata_k_tv,
+                hashdata.hashdata_v_tv,
+                pair_tv,
+                uniq_res_tv,
+                indice_pairs_uniq_tv,
+                out_inds_tv,
+                indice_num_per_loc_tv,
+                num_out_act=num_act_out,
+                batch_size=batch_size,
+                output_dims=out_shape,
+                input_dims=spatial_shape,
+                ksize=ksize,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                transposed=transpose,
+                stream_int=stream,
+                use_bound_algo=use_bound_algo,
+            )
         else:
-            out_inds = torch.empty((kv * indices.shape[0], indices.shape[1]),
-                                   dtype=indices.dtype,
-                                   device=indices.device)
+            out_inds = torch.empty(
+                (kv * indices.shape[0], indices.shape[1]),
+                dtype=indices.dtype,
+                device=indices.device,
+            )
             out_inds_tv = torch_tensor_to_tv(out_inds)
 
             num_act_out = SpconvOps.generate_conv_inds_cpu(
@@ -319,7 +360,8 @@ def get_indice_pairs(indices: torch.Tensor,
                 stride=stride,
                 padding=padding,
                 dilation=dilation,
-                transposed=transpose)
+                transposed=transpose,
+            )
             out_inds = out_inds[:num_act_out]
         # CONV.stream_synchronize(stream)
         # print("REGU", time.time() - t)
@@ -327,23 +369,24 @@ def get_indice_pairs(indices: torch.Tensor,
 
 
 def get_indice_pairs_implicit_gemm(
-        indices: torch.Tensor,
-        batch_size: int,
-        spatial_shape: List[int],
-        algo: ConvAlgo,
-        ksize: List[int],
-        stride: List[int],
-        padding: List[int],
-        dilation: List[int],
-        out_padding: List[int],
-        subm: bool = False,
-        transpose: bool = False,
-        is_train: bool = True,
-        alloc: Optional[ThrustSortAllocator] = None,
-        timer: CUDAKernelTimer = CUDAKernelTimer(False),
-        num_out_act_bound: int = -1,
-        direct_table: bool = SPCONV_USE_DIRECT_TABLE,
-        do_sort=SPCONV_DO_SORT):
+    indices: torch.Tensor,
+    batch_size: int,
+    spatial_shape: List[int],
+    algo: ConvAlgo,
+    ksize: List[int],
+    stride: List[int],
+    padding: List[int],
+    dilation: List[int],
+    out_padding: List[int],
+    subm: bool = False,
+    transpose: bool = False,
+    is_train: bool = True,
+    alloc: Optional[ThrustSortAllocator] = None,
+    timer: CUDAKernelTimer = CUDAKernelTimer(False),
+    num_out_act_bound: int = -1,
+    direct_table: bool = SPCONV_USE_DIRECT_TABLE,
+    do_sort=SPCONV_DO_SORT,
+):
     """
     Why return tuple? because pytorch seems don't support custom object in autograd.
     return: (
@@ -384,9 +427,10 @@ def get_indice_pairs_implicit_gemm(
             num_out_act_bound,
             timer=timer_cpp,
             direct_table=direct_table,
-            do_sort=do_sort)
+            do_sort=do_sort,
+        )
         mask_split_count = mask_tensor.dim(0)
-        masks = [mask_tensor[i:i + 1].numpy() for i in range(mask_split_count)]
+        masks = [mask_tensor[i : i + 1].numpy() for i in range(mask_split_count)]
         if subm:
             out_inds = indices
         else:
@@ -398,19 +442,24 @@ def get_indice_pairs_implicit_gemm(
             pair = thalloc.allocated[AllocKeys.PairFwd]
             pair_mask = thalloc.allocated[AllocKeys.PairMask]
             mask_argsort = thalloc.allocated[AllocKeys.MaskArgSort]
-            pair_mask_in_splits = [
-                pair_mask[i] for i in range(mask_split_count)
-            ]
-            mask_argsort_in_splits = [
-                mask_argsort[i] for i in range(mask_split_count)
-            ]
+            pair_mask_in_splits = [pair_mask[i] for i in range(mask_split_count)]
+            mask_argsort_in_splits = [mask_argsort[i] for i in range(mask_split_count)]
             pair_bwd = torch.Tensor()
             pair_fwd = pair[0]
             if is_train:
                 assert pair.shape[0] == 2
                 pair_bwd = pair[1]
-            return (out_inds, indice_num_per_loc, pair[0], pair_bwd,
-                    pair_mask_in_splits, [], mask_argsort_in_splits, [], masks)
+            return (
+                out_inds,
+                indice_num_per_loc,
+                pair[0],
+                pair_bwd,
+                pair_mask_in_splits,
+                [],
+                mask_argsort_in_splits,
+                [],
+                masks,
+            )
         else:
             pair_bwd = thalloc.allocated.get(AllocKeys.PairBwd, torch.Tensor())
             pair_fwd = thalloc.allocated[AllocKeys.PairFwd]
@@ -431,16 +480,21 @@ def get_indice_pairs_implicit_gemm(
                 mask_argsort_bwd_splits = [
                     mask_argsort_bwd[i] for i in range(mask_split_count)
                 ]
-            pair_mask_fwd_splits = [
-                pair_mask_fwd[i] for i in range(mask_split_count)
-            ]
+            pair_mask_fwd_splits = [pair_mask_fwd[i] for i in range(mask_split_count)]
             mask_argsort_fwd_splits = [
                 mask_argsort_fwd[i] for i in range(mask_split_count)
             ]
-            return (out_inds, indice_num_per_loc, pair_fwd, pair_bwd,
-                    pair_mask_fwd_splits, pair_mask_bwd_splits,
-                    mask_argsort_fwd_splits, mask_argsort_bwd_splits, masks)
-    assert indices.is_cuda, "implicit gemm only support cuda"
+            return (
+                out_inds,
+                indice_num_per_loc,
+                pair_fwd,
+                pair_bwd,
+                pair_mask_fwd_splits,
+                pair_mask_bwd_splits,
+                mask_argsort_fwd_splits,
+                mask_argsort_bwd_splits,
+                masks,
+            )
     ndim = indices.shape[1] - 1
     kv: int = functools.reduce(lambda x, y: x * y, ksize, 1)
     # TODO in future we will support up to 128 kernel volume.
@@ -449,11 +503,13 @@ def get_indice_pairs_implicit_gemm(
 
     if not subm:
         if transpose:
-            out_shape = get_deconv_output_size(spatial_shape, ksize, stride,
-                                               padding, dilation, out_padding)
+            out_shape = get_deconv_output_size(
+                spatial_shape, ksize, stride, padding, dilation, out_padding
+            )
         else:
-            out_shape = get_conv_output_size(spatial_shape, ksize, stride,
-                                             padding, dilation)
+            out_shape = get_conv_output_size(
+                spatial_shape, ksize, stride, padding, dilation
+            )
     else:
         out_shape = spatial_shape
     if any([x == 0 for x in out_shape]):
@@ -463,30 +519,33 @@ def get_indice_pairs_implicit_gemm(
     spatial_volume = functools.reduce(lambda x, y: x * y, spatial_shape, 1) * batch_size
     use_int64_hash_k = spatial_volume >= INT32_MAX or DEBUG_INT64_HASH_K
     indice_dtype = torch.int64 if use_int64_hash_k else indices.dtype
-    assert algo == ConvAlgo.MaskImplicitGemm or algo == ConvAlgo.MaskSplitImplicitGemm, "TODO"
+    assert (
+        algo == ConvAlgo.MaskImplicitGemm or algo == ConvAlgo.MaskSplitImplicitGemm
+    ), "TODO"
     is_mask_split = algo == ConvAlgo.MaskSplitImplicitGemm
     mask_split_count = 2 if is_mask_split else 1
     if subm:
         if is_train:
-            pair = torch.full((2, kv, indices.shape[0]),
-                              -1,
-                              dtype=indices.dtype,
-                              device=indices.device)
+            pair = torch.full(
+                (2, kv, indices.shape[0]),
+                -1,
+                dtype=indices.dtype,
+                device=indices.device,
+            )
         else:
-            pair = torch.full((1, kv, indices.shape[0]),
-                              -1,
-                              dtype=indices.dtype,
-                              device=indices.device)
+            pair = torch.full(
+                (1, kv, indices.shape[0]),
+                -1,
+                dtype=indices.dtype,
+                device=indices.device,
+            )
     else:
         # for regular conv, pair-in not equal to pair-out
-        pair = torch.full((kv, indices.shape[0]),
-                          -1,
-                          dtype=indices.dtype,
-                          device=indices.device)
+        pair = torch.full(
+            (kv, indices.shape[0]), -1, dtype=indices.dtype, device=indices.device
+        )
 
-    indice_num_per_loc = torch.zeros((kv, ),
-                                     dtype=indices.dtype,
-                                     device=indices.device)
+    indice_num_per_loc = torch.zeros((kv,), dtype=indices.dtype, device=indices.device)
 
     inds_tv = torch_tensor_to_tv(indices)
     pair_tv = torch_tensor_to_tv(pair)
@@ -496,48 +555,53 @@ def get_indice_pairs_implicit_gemm(
         kv_div_2 = kv // 2
         remain = kv - kv_div_2
         mask_np_1 = np.array([1], dtype=np.uint64)
-        first = ((mask_np_1 << (remain)) - 1)
+        first = (mask_np_1 << (remain)) - 1
         second = ((mask_np_1 << (kv_div_2)) - 1) << remain
         masks = [first.astype(np.uint32), second.astype(np.uint32)]
     else:
-        masks = [np.array([0xffffffff], dtype=np.uint32)]
+        masks = [np.array([0xFFFFFFFF], dtype=np.uint32)]
 
     if subm:
         out_inds = indices
         # hashdata = torch.empty((out_inds.shape[0] * 2, ),
         #                        dtype=torch.int64,
         #                        device=indices.device)
-        hashdata = _HashData(out_inds.shape[0], use_int64_hash_k,
-                             indices.device)
+        hashdata = _HashData(out_inds.shape[0], use_int64_hash_k, indices.device)
 
-        pair_mask = torch.empty((mask_split_count, indices.shape[0], mask_int_count),
-                                dtype=torch.int32,
-                                device=indices.device)
+        pair_mask = torch.empty(
+            (mask_split_count, indices.shape[0], mask_int_count),
+            dtype=torch.int32,
+            device=indices.device,
+        )
 
         out_inds_tv = torch_tensor_to_tv(out_inds)
         # hashdata_tv = torch_tensor_to_tv(hashdata, dtype=tv.custom64)
         pair_mask_tv = torch_tensor_to_tv(pair_mask, dtype=tv.uint32)
         with timer.record("gen_subm_inds", stream):
-            SpconvOps.generate_subm_conv_inds(inds_tv,
-                                              hashdata.hashdata_k_tv,
-                                              hashdata.hashdata_v_tv,
-                                              pair_tv,
-                                              out_inds_tv,
-                                              indice_num_per_loc_tv,
-                                              batch_size=batch_size,
-                                              input_dims=spatial_shape,
-                                              ksize=ksize,
-                                              dilation=dilation,
-                                              indice_pair_mask=pair_mask_tv,
-                                              backward=is_train,
-                                              stream_int=stream)
+            SpconvOps.generate_subm_conv_inds(
+                inds_tv,
+                hashdata.hashdata_k_tv,
+                hashdata.hashdata_v_tv,
+                pair_tv,
+                out_inds_tv,
+                indice_num_per_loc_tv,
+                batch_size=batch_size,
+                input_dims=spatial_shape,
+                ksize=ksize,
+                dilation=dilation,
+                indice_pair_mask=pair_mask_tv,
+                backward=is_train,
+                stream_int=stream,
+            )
         # torch.cuda.synchronize()
         # print("SUBM0", time.time() - t)
         # CONV.stream_synchronize(stream)
 
-        mask_argsort = torch.empty((mask_split_count, out_inds.shape[0]),
-                                   dtype=torch.int32,
-                                   device=indices.device)
+        mask_argsort = torch.empty(
+            (mask_split_count, out_inds.shape[0]),
+            dtype=torch.int32,
+            device=indices.device,
+        )
         mask_argsort_tv = torch_tensor_to_tv(mask_argsort)
         if alloc is None:
             alloc = ThrustSortAllocator(indices.device)
@@ -547,44 +611,67 @@ def get_indice_pairs_implicit_gemm(
                 # so I use this stupid hack to use torch allocator without touch
                 # pytorch binary (c++).
                 # f**k thrust
-                SpconvOps.sort_1d_by_key_allocator(pair_mask_tv[j],
-                                                    alloc.alloc,
-                                                    mask_argsort_tv[j], stream,
-                                                    mask_int_count,
-                                                    do_sort=do_sort)
+                SpconvOps.sort_1d_by_key_allocator(
+                    pair_mask_tv[j],
+                    alloc.alloc,
+                    mask_argsort_tv[j],
+                    stream,
+                    mask_int_count,
+                    do_sort=do_sort,
+                )
         # CONV.stream_synchronize(stream)
         pair_mask_in_splits = [pair_mask[i] for i in range(mask_split_count)]
-        mask_argsort_in_splits = [
-            mask_argsort[i] for i in range(mask_split_count)
-        ]
+        mask_argsort_in_splits = [mask_argsort[i] for i in range(mask_split_count)]
         if is_train:
-            return (out_inds, indice_num_per_loc, pair[0], pair[1],
-                    pair_mask_in_splits, [], mask_argsort_in_splits, [], masks)
+            return (
+                out_inds,
+                indice_num_per_loc,
+                pair[0],
+                pair[1],
+                pair_mask_in_splits,
+                [],
+                mask_argsort_in_splits,
+                [],
+                masks,
+            )
         else:
-            return (out_inds, indice_num_per_loc, pair[0], torch.Tensor(),
-                    pair_mask_in_splits, [], mask_argsort_in_splits, [], masks)
+            return (
+                out_inds,
+                indice_num_per_loc,
+                pair[0],
+                torch.Tensor(),
+                pair_mask_in_splits,
+                [],
+                mask_argsort_in_splits,
+                [],
+                masks,
+            )
     else:
         max_num_act = SpconvOps.get_handcrafted_max_act_out(
-            indices.shape[0], ksize, stride, padding, dilation)
+            indices.shape[0], ksize, stride, padding, dilation
+        )
         if transpose:
             max_num_act = kv * indices.shape[0]
         pair_bwd = pair
         pair_bwd_tv = pair_tv
-        indice_pairs_uniq = torch.empty((pair.numel() + 1, ),
-                                        dtype=indice_dtype,
-                                        device=indices.device)
+        indice_pairs_uniq = torch.empty(
+            (pair.numel() + 1,), dtype=indice_dtype, device=indices.device
+        )
         indice_pairs_uniq_tv = torch_tensor_to_tv(indice_pairs_uniq)
         hashdata = _HashData(0, use_int64_hash_k, indices.device)
         indice_pairs_uniq_bkp_tv = tv.Tensor()
         if direct_table:
             # print("HASH SIZE", max_num_act * 2)
-            hashdata = _HashData(max_num_act, use_int64_hash_k, indices.device,
-                                 SPCONV_DIRECT_TABLE_HASH_SIZE_SCALE)
-            indice_pairs_uniq_bkp = torch.empty((pair.numel() + 1, ),
-                                                dtype=indice_dtype,
-                                                device=indices.device)
-            indice_pairs_uniq_bkp_tv = torch_tensor_to_tv(
-                indice_pairs_uniq_bkp)
+            hashdata = _HashData(
+                max_num_act,
+                use_int64_hash_k,
+                indices.device,
+                SPCONV_DIRECT_TABLE_HASH_SIZE_SCALE,
+            )
+            indice_pairs_uniq_bkp = torch.empty(
+                (pair.numel() + 1,), dtype=indice_dtype, device=indices.device
+            )
+            indice_pairs_uniq_bkp_tv = torch_tensor_to_tv(indice_pairs_uniq_bkp)
             with timer.record("gen_conv_inds_stage1", stream):
                 SpconvOps.generate_conv_inds_mask_stage1_direct_table(
                     inds_tv,
@@ -601,7 +688,8 @@ def get_indice_pairs_implicit_gemm(
                     padding=padding,
                     dilation=dilation,
                     transposed=transpose,
-                    stream_int=stream)
+                    stream_int=stream,
+                )
         else:
             with timer.record("gen_conv_inds_stage1", stream):
                 SpconvOps.generate_conv_inds_mask_stage1(
@@ -617,19 +705,21 @@ def get_indice_pairs_implicit_gemm(
                     padding=padding,
                     dilation=dilation,
                     transposed=transpose,
-                    stream_int=stream)
+                    stream_int=stream,
+                )
         uniq_out_indices_offset_tv = tv.Tensor()
         with timer.record(f"unique_{indice_pairs_uniq.shape[0]}", stream):
             if direct_table:
-                uniq_cnt = torch.zeros([1],
-                                       dtype=torch.int32,
-                                       device=indices.device)
+                uniq_cnt = torch.zeros([1], dtype=torch.int32, device=indices.device)
                 uniq_cnt_tv = torch_tensor_to_tv(uniq_cnt)
-                num_act_out = SpconvOps.unique_hash(hashdata.hashdata_k_tv,
-                                                    hashdata.hashdata_v_tv,
-                                                    uniq_cnt_tv,
-                                                    indice_pairs_uniq_tv,
-                                                    num_out_act_bound, stream)
+                num_act_out = SpconvOps.unique_hash(
+                    hashdata.hashdata_k_tv,
+                    hashdata.hashdata_v_tv,
+                    uniq_cnt_tv,
+                    indice_pairs_uniq_tv,
+                    num_out_act_bound,
+                    stream,
+                )
                 uniq_out_indices_offset_tv = indice_pairs_uniq_tv
                 raw_out_indices_offset_tv = indice_pairs_uniq_bkp_tv
             else:
@@ -637,40 +727,42 @@ def get_indice_pairs_implicit_gemm(
                 num_act_out = uniq_res.shape[0] - 1
                 uniq_out_indices_offset_tv = torch_tensor_to_tv(uniq_res)
                 raw_out_indices_offset_tv = indice_pairs_uniq_tv
-            if (num_act_out == 0):
-                msg = _POINT_VANISH_MSG.format(spatial_shape, ksize, stride, padding, dilation)
+            if num_act_out == 0:
+                msg = _POINT_VANISH_MSG.format(
+                    spatial_shape, ksize, stride, padding, dilation
+                )
                 raise ValueError(msg)
 
         if num_out_act_bound > 0 and num_act_out > num_out_act_bound:
             num_act_out = num_out_act_bound
-        with timer.record(f"alloc_stage2", stream):
+        with timer.record("alloc_stage2", stream):
+            out_inds = torch.empty(
+                (num_act_out, indices.shape[1]),
+                dtype=indices.dtype,
+                device=indices.device,
+            )
 
-            out_inds = torch.empty((num_act_out, indices.shape[1]),
-                                   dtype=indices.dtype,
-                                   device=indices.device)
-
-            pair_fwd = torch.full((kv, num_act_out),
-                                  -1,
-                                  dtype=indices.dtype,
-                                  device=indices.device)
-            pair_mask_fwd = torch.zeros((mask_split_count, num_act_out, mask_int_count),
-                                        dtype=torch.int32,
-                                        device=indices.device)
+            pair_fwd = torch.full(
+                (kv, num_act_out), -1, dtype=indices.dtype, device=indices.device
+            )
+            pair_mask_fwd = torch.zeros(
+                (mask_split_count, num_act_out, mask_int_count),
+                dtype=torch.int32,
+                device=indices.device,
+            )
             pair_fwd_tv = torch_tensor_to_tv(pair_fwd)
-            pair_mask_fwd_tv = torch_tensor_to_tv(pair_mask_fwd,
-                                                  dtype=tv.uint32)
+            pair_mask_fwd_tv = torch_tensor_to_tv(pair_mask_fwd, dtype=tv.uint32)
             pair_mask_bwd = torch.Tensor()
             pair_mask_bwd_tv = tv.Tensor()
             if is_train:
                 pair_mask_bwd = torch.zeros(
                     (mask_split_count, indices.shape[0], mask_int_count),
                     dtype=torch.int32,
-                    device=indices.device)
-                pair_mask_bwd_tv = torch_tensor_to_tv(pair_mask_bwd,
-                                                      dtype=tv.uint32)
+                    device=indices.device,
+                )
+                pair_mask_bwd_tv = torch_tensor_to_tv(pair_mask_bwd, dtype=tv.uint32)
         if not direct_table:
-            hashdata = _HashData(out_inds.shape[0], use_int64_hash_k,
-                                 indices.device)
+            hashdata = _HashData(out_inds.shape[0], use_int64_hash_k, indices.device)
 
         # hashdata = torch.empty((out_inds.shape[0] * 2, ),
         #                        dtype=torch.int64,
@@ -680,41 +772,47 @@ def get_indice_pairs_implicit_gemm(
         with timer.record(f"gen_conv_inds_stage2_{num_act_out}", stream):
             stage2_fn = SpconvOps.generate_conv_inds_mask_stage2
             if direct_table:
-                SpconvOps.assign_output_direct_hash(indice_pairs_uniq_tv,
-                                                    out_inds_tv,
-                                                    batch_size=batch_size,
-                                                    output_dims=out_shape,
-                                                    input_dims=spatial_shape,
-                                                    ksize=ksize,
-                                                    stride=stride,
-                                                    padding=padding,
-                                                    dilation=dilation,
-                                                    stream_int=stream)
+                SpconvOps.assign_output_direct_hash(
+                    indice_pairs_uniq_tv,
+                    out_inds_tv,
+                    batch_size=batch_size,
+                    output_dims=out_shape,
+                    input_dims=spatial_shape,
+                    ksize=ksize,
+                    stride=stride,
+                    padding=padding,
+                    dilation=dilation,
+                    stream_int=stream,
+                )
                 stage2_fn = SpconvOps.generate_conv_inds_stage2_mask_direct_table
 
-            stage2_fn(inds_tv,
-                      hashdata.hashdata_k_tv,
-                      hashdata.hashdata_v_tv,
-                      pair_fwd_tv,
-                      pair_bwd_tv,
-                      uniq_out_indices_offset_tv,
-                      raw_out_indices_offset_tv,
-                      out_inds_tv,
-                      pair_mask_fwd_tv,
-                      pair_mask_bwd_tv,
-                      num_out_act=num_act_out,
-                      batch_size=batch_size,
-                      output_dims=out_shape,
-                      input_dims=spatial_shape,
-                      ksize=ksize,
-                      stride=stride,
-                      padding=padding,
-                      dilation=dilation,
-                      transposed=transpose,
-                      stream_int=stream)
-        mask_argsort_fwd = torch.empty((mask_split_count, out_inds.shape[0]),
-                                       dtype=torch.int32,
-                                       device=indices.device)
+            stage2_fn(
+                inds_tv,
+                hashdata.hashdata_k_tv,
+                hashdata.hashdata_v_tv,
+                pair_fwd_tv,
+                pair_bwd_tv,
+                uniq_out_indices_offset_tv,
+                raw_out_indices_offset_tv,
+                out_inds_tv,
+                pair_mask_fwd_tv,
+                pair_mask_bwd_tv,
+                num_out_act=num_act_out,
+                batch_size=batch_size,
+                output_dims=out_shape,
+                input_dims=spatial_shape,
+                ksize=ksize,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                transposed=transpose,
+                stream_int=stream,
+            )
+        mask_argsort_fwd = torch.empty(
+            (mask_split_count, out_inds.shape[0]),
+            dtype=torch.int32,
+            device=indices.device,
+        )
         mask_argsort_fwd_tv = torch_tensor_to_tv(mask_argsort_fwd)
         mask_argsort_bwd_tv = tv.Tensor()
         mask_argsort_bwd = torch.Tensor()
@@ -722,7 +820,8 @@ def get_indice_pairs_implicit_gemm(
             mask_argsort_bwd = torch.empty(
                 (mask_split_count, indices.shape[0]),
                 dtype=torch.int32,
-                device=indices.device)
+                device=indices.device,
+            )
 
             mask_argsort_bwd_tv = torch_tensor_to_tv(mask_argsort_bwd)
         if alloc is None:
@@ -734,23 +833,43 @@ def get_indice_pairs_implicit_gemm(
                     # here we try to ensure only call allocator once.
                     if not is_train:
                         SpconvOps.sort_1d_by_key_split_allocator(
-                            pair_mask_fwd_tv[j], alloc.alloc, mask_tv,
-                            mask_argsort_fwd_tv[j], stream)
+                            pair_mask_fwd_tv[j],
+                            alloc.alloc,
+                            mask_tv,
+                            mask_argsort_fwd_tv[j],
+                            stream,
+                        )
                     else:
                         if pair_mask_bwd_tv.dim(1) > pair_mask_fwd_tv.dim(1):
                             SpconvOps.sort_1d_by_key_split_allocator(
-                                pair_mask_bwd_tv[j], alloc.alloc, mask_tv,
-                                mask_argsort_bwd_tv[j], stream)
+                                pair_mask_bwd_tv[j],
+                                alloc.alloc,
+                                mask_tv,
+                                mask_argsort_bwd_tv[j],
+                                stream,
+                            )
                             SpconvOps.sort_1d_by_key_split_allocator(
-                                pair_mask_fwd_tv[j], alloc.alloc, mask_tv,
-                                mask_argsort_fwd_tv[j], stream)
+                                pair_mask_fwd_tv[j],
+                                alloc.alloc,
+                                mask_tv,
+                                mask_argsort_fwd_tv[j],
+                                stream,
+                            )
                         else:
                             SpconvOps.sort_1d_by_key_split_allocator(
-                                pair_mask_fwd_tv[j], alloc.alloc, mask_tv,
-                                mask_argsort_fwd_tv[j], stream)
+                                pair_mask_fwd_tv[j],
+                                alloc.alloc,
+                                mask_tv,
+                                mask_argsort_fwd_tv[j],
+                                stream,
+                            )
                             SpconvOps.sort_1d_by_key_split_allocator(
-                                pair_mask_bwd_tv[j], alloc.alloc, mask_tv,
-                                mask_argsort_bwd_tv[j], stream)
+                                pair_mask_bwd_tv[j],
+                                alloc.alloc,
+                                mask_tv,
+                                mask_argsort_bwd_tv[j],
+                                stream,
+                            )
 
                     # SpconvOps.sort_1d_by_key_split(pair_mask_fwd_tv[j], mask_tv,
                     #                                mask_argsort_fwd_tv[j], stream)
@@ -763,26 +882,49 @@ def get_indice_pairs_implicit_gemm(
             else:
                 # if pair_mask_bwd_tv.dim(1) > pair_mask_fwd_tv.dim(1):
                 if not is_train:
-                    SpconvOps.sort_1d_by_key_allocator(pair_mask_fwd_tv[0],
-                                                                 alloc.alloc,
-                                                                 mask_argsort_fwd_tv[0],
-                                                                 stream,
-                                                                 mask_int_count, do_sort=do_sort)
+                    SpconvOps.sort_1d_by_key_allocator(
+                        pair_mask_fwd_tv[0],
+                        alloc.alloc,
+                        mask_argsort_fwd_tv[0],
+                        stream,
+                        mask_int_count,
+                        do_sort=do_sort,
+                    )
                 else:
                     if pair_mask_bwd_tv.dim(1) > pair_mask_fwd_tv.dim(1):
                         SpconvOps.sort_1d_by_key_allocator(
-                            pair_mask_bwd_tv[0], alloc.alloc,
-                            mask_argsort_bwd_tv[0], stream, mask_int_count, do_sort=do_sort)
+                            pair_mask_bwd_tv[0],
+                            alloc.alloc,
+                            mask_argsort_bwd_tv[0],
+                            stream,
+                            mask_int_count,
+                            do_sort=do_sort,
+                        )
                         SpconvOps.sort_1d_by_key_allocator(
-                            pair_mask_fwd_tv[0], alloc.alloc,
-                            mask_argsort_fwd_tv[0], stream, mask_int_count, do_sort=do_sort)
+                            pair_mask_fwd_tv[0],
+                            alloc.alloc,
+                            mask_argsort_fwd_tv[0],
+                            stream,
+                            mask_int_count,
+                            do_sort=do_sort,
+                        )
                     else:
                         SpconvOps.sort_1d_by_key_allocator(
-                            pair_mask_fwd_tv[0], alloc.alloc,
-                            mask_argsort_fwd_tv[0], stream, mask_int_count, do_sort=do_sort)
+                            pair_mask_fwd_tv[0],
+                            alloc.alloc,
+                            mask_argsort_fwd_tv[0],
+                            stream,
+                            mask_int_count,
+                            do_sort=do_sort,
+                        )
                         SpconvOps.sort_1d_by_key_allocator(
-                            pair_mask_bwd_tv[0], alloc.alloc,
-                            mask_argsort_bwd_tv[0], stream, mask_int_count, do_sort=do_sort)
+                            pair_mask_bwd_tv[0],
+                            alloc.alloc,
+                            mask_argsort_bwd_tv[0],
+                            stream,
+                            mask_int_count,
+                            do_sort=do_sort,
+                        )
 
         # CONV.stream_synchronize(stream)
         if not is_train:
@@ -790,37 +932,41 @@ def get_indice_pairs_implicit_gemm(
             pair_mask_bwd_splits: List[torch.Tensor] = []
             mask_argsort_bwd_splits: List[torch.Tensor] = []
         else:
-            pair_mask_bwd_splits = [
-                pair_mask_bwd[i] for i in range(mask_split_count)
-            ]
+            pair_mask_bwd_splits = [pair_mask_bwd[i] for i in range(mask_split_count)]
             mask_argsort_bwd_splits = [
                 mask_argsort_bwd[i] for i in range(mask_split_count)
             ]
-        pair_mask_fwd_splits = [
-            pair_mask_fwd[i] for i in range(mask_split_count)
-        ]
-        mask_argsort_fwd_splits = [
-            mask_argsort_fwd[i] for i in range(mask_split_count)
-        ]
+        pair_mask_fwd_splits = [pair_mask_fwd[i] for i in range(mask_split_count)]
+        mask_argsort_fwd_splits = [mask_argsort_fwd[i] for i in range(mask_split_count)]
 
-        return (out_inds, indice_num_per_loc, pair_fwd, pair_bwd,
-                pair_mask_fwd_splits, pair_mask_bwd_splits,
-                mask_argsort_fwd_splits, mask_argsort_bwd_splits, masks)
+        return (
+            out_inds,
+            indice_num_per_loc,
+            pair_fwd,
+            pair_bwd,
+            pair_mask_fwd_splits,
+            pair_mask_bwd_splits,
+            mask_argsort_fwd_splits,
+            mask_argsort_bwd_splits,
+            masks,
+        )
 
 
-def indice_conv(features: torch.Tensor,
-                filters: torch.Tensor,
-                indice_pairs: torch.Tensor,
-                indice_pair_num: torch.Tensor,
-                num_activate_out: int,
-                inverse: bool = False,
-                subm: bool = False,
-                algo: ConvAlgo = ConvAlgo.Native,
-                timer: CUDAKernelTimer = CUDAKernelTimer(False),
-                bias: Optional[torch.Tensor] = None,
-                act_alpha: float = 0.0,
-                act_beta: float = 0.0,
-                act_type: tv.gemm.Activation = tv.gemm.Activation.None_):
+def indice_conv(
+    features: torch.Tensor,
+    filters: torch.Tensor,
+    indice_pairs: torch.Tensor,
+    indice_pair_num: torch.Tensor,
+    num_activate_out: int,
+    inverse: bool = False,
+    subm: bool = False,
+    algo: ConvAlgo = ConvAlgo.Native,
+    timer: CUDAKernelTimer = CUDAKernelTimer(False),
+    bias: Optional[torch.Tensor] = None,
+    act_alpha: float = 0.0,
+    act_beta: float = 0.0,
+    act_type: tv.gemm.Activation = tv.gemm.Activation.None_,
+):
     # filters: RSKC
     # stream = get_current_stream()
     # CONV.stream_synchronize(stream)
@@ -857,12 +1003,28 @@ def indice_conv(features: torch.Tensor,
             # plain get_arch by cuda api is VERY SLOW.
             arch = get_arch()
             stream = get_current_stream()
-        ConvGemmOps.indice_conv(alloc, ext_mm, GEMM_CPP, ALL_WEIGHT_IS_KRSC,
-                                FILTER_HWIO, features_tv, filters_tv,
-                                indice_pairs_tv, indice_pair_num_tv, arch,
-                                num_activate_out, inverse, subm, algo.value,
-                                stream, bias_tv, act_alpha, act_beta, act_type,
-                                use_tf32=constants.SPCONV_ALLOW_TF32)
+        ConvGemmOps.indice_conv(
+            alloc,
+            ext_mm,
+            GEMM_CPP,
+            ALL_WEIGHT_IS_KRSC,
+            FILTER_HWIO,
+            features_tv,
+            filters_tv,
+            indice_pairs_tv,
+            indice_pair_num_tv,
+            arch,
+            num_activate_out,
+            inverse,
+            subm,
+            algo.value,
+            stream,
+            bias_tv,
+            act_alpha,
+            act_beta,
+            act_type,
+            use_tf32=constants.SPCONV_ALLOW_TF32,
+        )
         out_features = alloc.allocated[AllocKeys.OutFeatures]
         return out_features
     if not features.is_cuda:
@@ -872,8 +1034,6 @@ def indice_conv(features: torch.Tensor,
 
     has_bias = bias is not None
     has_act = act_type != tv.gemm.Activation.None_
-    if has_bias or has_act:
-        assert features.is_cuda, "cpu don't support act and bias"
     if not ALL_WEIGHT_IS_KRSC:
         kv_dim = 0
         is_KC_not_CK = not FILTER_HWIO
@@ -909,28 +1069,34 @@ def indice_conv(features: torch.Tensor,
             else:
                 # pytorch 1.12 don't support cpu half mm, f**k pytorch
                 # we need cpu fp16 mm for test only.
-                out_features = torch.empty((features.shape[0], out_channel),
-                                           dtype=features.dtype,
-                                           device=features.device)
+                out_features = torch.empty(
+                    (features.shape[0], out_channel),
+                    dtype=features.dtype,
+                    device=features.device,
+                )
                 features_np = torch_tensor_to_tv(features).numpy_view()
                 filters_np = torch_tensor_to_tv(filters).numpy_view()
                 out_features_np = torch_tensor_to_tv(out_features).numpy_view()
-                np.matmul(features_np,
-                          filters_np[:, kv_center].T,
-                          out=out_features_np)
+                np.matmul(features_np, filters_np[:, kv_center].T, out=out_features_np)
                 # out_features = torch.mm(features, filters[:, kv_center].T)
     else:
-        out_features = torch.zeros((num_activate_out, out_channel),
-                                   dtype=features.dtype,
-                                   device=features.device)
+        out_features = torch.zeros(
+            (num_activate_out, out_channel),
+            dtype=features.dtype,
+            device=features.device,
+        )
     c = torch_tensor_to_tv(out_features)
 
     if kv == 1 and subm:
-        if (has_act and has_bias):
-            InferenceOps.bias_add_act_inplace(c, bias_tv, act_type, act_alpha, act_beta, stream)
+        if has_act and has_bias:
+            InferenceOps.bias_add_act_inplace(
+                c, bias_tv, act_type, act_alpha, act_beta, stream
+            )
         else:
             if has_act:
-                InferenceOps.activation_inplace(c, act_type, act_alpha, act_beta, stream)
+                InferenceOps.activation_inplace(
+                    c, act_type, act_alpha, act_beta, stream
+                )
             if has_bias:
                 InferenceOps.bias_add_inplace(c, bias_tv, stream)
 
@@ -952,10 +1118,10 @@ def indice_conv(features: torch.Tensor,
         # perform gather-mm-scatter_add for cpu data
         assert not filters.is_cuda
         assert not indice_pairs.is_cuda
-        inp_buffer = torch.empty([maxnhot, features.shape[1]],
-                                 dtype=features.dtype)
-        out_buffer = torch.empty([maxnhot, out_features.shape[1]],
-                                 dtype=out_features.dtype)
+        inp_buffer = torch.empty([maxnhot, features.shape[1]], dtype=features.dtype)
+        out_buffer = torch.empty(
+            [maxnhot, out_features.shape[1]], dtype=out_features.dtype
+        )
         inp_buffer_tv = torch_tensor_to_tv(inp_buffer)
         out_buffer_tv = torch_tensor_to_tv(out_buffer)
 
@@ -974,13 +1140,14 @@ def indice_conv(features: torch.Tensor,
             if features.dtype == torch.float16:
                 inp_buffer_np = torch_tensor_to_tv(inp_buffer).numpy_view()
                 filters_np = torch_tensor_to_tv(filters).numpy_view()
-                filters_i_np = filters_np[
-                    i] if not ALL_WEIGHT_IS_KRSC else filters_np[:, i]
+                filters_i_np = (
+                    filters_np[i] if not ALL_WEIGHT_IS_KRSC else filters_np[:, i]
+                )
                 filters_cur_np = filters_i_np if not is_KC_not_CK else filters_i_np.T
                 out_buffer_np = torch_tensor_to_tv(out_buffer).numpy_view()
-                np.matmul(inp_buffer_np[:nhot],
-                          filters_cur_np,
-                          out=out_buffer_np[:nhot])
+                np.matmul(
+                    inp_buffer_np[:nhot], filters_cur_np, out=out_buffer_np[:nhot]
+                )
             else:
                 torch.mm(inp_buffer[:nhot], filters_cur, out=out_buffer[:nhot])
             SpconvOps.scatter_add_cpu(c, out_buffer_tv, out_indices)
@@ -1003,26 +1170,27 @@ def indice_conv(features: torch.Tensor,
     # print(nhot_profile, indice_pair_num_cpu)
     arch = get_arch()
 
-    tuned_res = GEMM.get_tuned_algo(a.dtype,
-                                    filters_tv.dtype,
-                                    c.dtype,
-                                    a.shape,
-                                    filter_shape_per_kv,
-                                    c.shape,
-                                    False,
-                                    is_KC_not_CK,
-                                    False,
-                                    arch=arch,
-                                    shuffle_type=ShuffleStrideType.ShuffleAC,
-                                    a_inds_shape=[nhot_profile],
-                                    c_inds_shape=[nhot_profile],
-                                    hint=AlgoHint.Fowrard.value)
+    tuned_res = GEMM.get_tuned_algo(
+        a.dtype,
+        filters_tv.dtype,
+        c.dtype,
+        a.shape,
+        filter_shape_per_kv,
+        c.shape,
+        False,
+        is_KC_not_CK,
+        False,
+        arch=arch,
+        shuffle_type=ShuffleStrideType.ShuffleAC,
+        a_inds_shape=[nhot_profile],
+        c_inds_shape=[nhot_profile],
+        hint=AlgoHint.Fowrard.value,
+    )
 
     if tuned_res is None:
         # run profile on center
         inp_indices_th = indice_pairs[int(inverse)][profile_idx, :nhot_profile]
-        out_indices_th = indice_pairs[int(not inverse)][
-            profile_idx, :nhot_profile]
+        out_indices_th = indice_pairs[int(not inverse)][profile_idx, :nhot_profile]
         inp_indices = torch_tensor_to_tv(inp_indices_th)
         out_indices = torch_tensor_to_tv(out_indices_th)
         # filter_tv = torch_tensor_to_tv(filters)[profile_idx]
@@ -1043,7 +1211,8 @@ def indice_conv(features: torch.Tensor,
             beta=0.0,
             hint=AlgoHint.Fowrard.value,
             stream=stream,
-            use_tf32=constants.SPCONV_ALLOW_TF32)
+            use_tf32=constants.SPCONV_ALLOW_TF32,
+        )
     # CONV.stream_synchronize(stream)
     # t = time.time()
     with timer.record("forward", stream):
@@ -1074,15 +1243,20 @@ def indice_conv(features: torch.Tensor,
                 c_inds=out_indices,
                 hint=AlgoHint.Fowrard.value,
                 alpha=1.0,
-                beta=beta)
+                beta=beta,
+            )
 
             # gather_times += gather_time
             inited = True
-        if (has_act and has_bias):
-            InferenceOps.bias_add_act_inplace(c, bias_tv, act_type, act_alpha, act_beta, stream)
+        if has_act and has_bias:
+            InferenceOps.bias_add_act_inplace(
+                c, bias_tv, act_type, act_alpha, act_beta, stream
+            )
         else:
             if has_act:
-                InferenceOps.activation_inplace(c, act_type, act_alpha, act_beta, stream)
+                InferenceOps.activation_inplace(
+                    c, act_type, act_alpha, act_beta, stream
+                )
             if has_bias:
                 InferenceOps.bias_add_inplace(c, bias_tv, stream)
 
@@ -1095,20 +1269,30 @@ def indice_conv(features: torch.Tensor,
     return out_features
 
 
-def fused_indice_conv(features, filters, bias, indice_pairs, indice_pair_num,
-                      num_activate_out, inverse, subm):
+def fused_indice_conv(
+    features,
+    filters,
+    bias,
+    indice_pairs,
+    indice_pair_num,
+    num_activate_out,
+    inverse,
+    subm,
+):
     raise NotImplementedError
 
 
-def indice_conv_backward(features: torch.Tensor,
-                         filters: torch.Tensor,
-                         out_bp: torch.Tensor,
-                         indice_pairs: torch.Tensor,
-                         indice_pair_num: torch.Tensor,
-                         inverse: bool = False,
-                         subm: bool = False,
-                         algo: ConvAlgo = ConvAlgo.Native,
-                         timer: CUDAKernelTimer = CUDAKernelTimer(False)):
+def indice_conv_backward(
+    features: torch.Tensor,
+    filters: torch.Tensor,
+    out_bp: torch.Tensor,
+    indice_pairs: torch.Tensor,
+    indice_pair_num: torch.Tensor,
+    inverse: bool = False,
+    subm: bool = False,
+    algo: ConvAlgo = ConvAlgo.Native,
+    timer: CUDAKernelTimer = CUDAKernelTimer(False),
+):
     # print(out_bp.mean(), out_bp.max(), out_bp.min())
     filters_shape = filters.shape
     # TODO handle this in nn.Module to make sure features in backward is contiguous
@@ -1139,12 +1323,24 @@ def indice_conv_backward(features: torch.Tensor,
         if features.is_cuda:
             stream = get_current_stream()
             arch = get_arch()
-        ConvGemmOps.indice_conv_backward(alloc, ext_mm, GEMM_CPP,
-                                         ALL_WEIGHT_IS_KRSC, FILTER_HWIO,
-                                         features_tv, filters_tv, out_bp_tv,
-                                         indice_pairs_tv, indice_pair_num_tv,
-                                         arch, inverse, subm, algo.value,
-                                         stream, use_tf32=constants.SPCONV_ALLOW_TF32)
+        ConvGemmOps.indice_conv_backward(
+            alloc,
+            ext_mm,
+            GEMM_CPP,
+            ALL_WEIGHT_IS_KRSC,
+            FILTER_HWIO,
+            features_tv,
+            filters_tv,
+            out_bp_tv,
+            indice_pairs_tv,
+            indice_pair_num_tv,
+            arch,
+            inverse,
+            subm,
+            algo.value,
+            stream,
+            use_tf32=constants.SPCONV_ALLOW_TF32,
+        )
         din = alloc.allocated[AllocKeys.DIn]
         df = alloc.allocated[AllocKeys.DFilters]
         return din, df
@@ -1215,10 +1411,8 @@ def indice_conv_backward(features: torch.Tensor,
         # perform gather-mm-scatter_add for cpu data
         assert not filters.is_cuda
         assert not indice_pairs.is_cuda
-        inp_buffer = torch.empty([maxnhot, features.shape[1]],
-                                 dtype=features.dtype)
-        out_buffer = torch.empty([maxnhot, out_bp.shape[1]],
-                                 dtype=out_bp.dtype)
+        inp_buffer = torch.empty([maxnhot, features.shape[1]], dtype=features.dtype)
+        out_buffer = torch.empty([maxnhot, out_bp.shape[1]], dtype=out_bp.dtype)
         inp_buffer_tv = torch_tensor_to_tv(inp_buffer)
         out_buffer_tv = torch_tensor_to_tv(out_buffer)
 
@@ -1239,14 +1433,10 @@ def indice_conv_backward(features: torch.Tensor,
             filters_KC = filters_i if is_KC_not_CK else filters_i.T
             if is_KC_not_CK:
                 # KN @ NC
-                torch.mm(out_buffer[:nhot].T,
-                         inp_buffer[:nhot],
-                         out=dfilters_i)
+                torch.mm(out_buffer[:nhot].T, inp_buffer[:nhot], out=dfilters_i)
             else:
                 # CN @ NK
-                torch.mm(inp_buffer[:nhot].T,
-                         out_buffer[:nhot],
-                         out=dfilters_i)
+                torch.mm(inp_buffer[:nhot].T, out_buffer[:nhot], out=dfilters_i)
             # NK @ KC
             torch.mm(out_buffer[:nhot], filters_KC, out=inp_buffer[:nhot])
             SpconvOps.scatter_add_cpu(din_tv, inp_buffer_tv, inp_indices)
@@ -1281,7 +1471,8 @@ def indice_conv_backward(features: torch.Tensor,
         shuffle_type=ShuffleStrideType.ShuffleAC,
         a_inds_shape=[nhot_profile],
         c_inds_shape=[nhot_profile],
-        hint=AlgoHint.BackwardInput.value)
+        hint=AlgoHint.BackwardInput.value,
+    )
     if tuned_res_dgrad is None:
         inp_indices = pair_in[profile_idx].slice_first_axis(0, nhot_profile)
         out_indices = pair_out[profile_idx].slice_first_axis(0, nhot_profile)
@@ -1301,7 +1492,8 @@ def indice_conv_backward(features: torch.Tensor,
             beta=0.0,
             hint=AlgoHint.BackwardInput.value,
             stream=stream,
-            use_tf32=constants.SPCONV_ALLOW_TF32)
+            use_tf32=constants.SPCONV_ALLOW_TF32,
+        )
     if is_KC_not_CK:
         a_wgrad = out_bp_tv
         b_wgrad = features_tv
@@ -1322,7 +1514,8 @@ def indice_conv_backward(features: torch.Tensor,
         shuffle_type=ShuffleStrideType.ShuffleAB,
         a_inds_shape=[nhot_profile],
         b_inds_shape=[nhot_profile],
-        hint=AlgoHint.BackwardWeight.value)
+        hint=AlgoHint.BackwardWeight.value,
+    )
 
     if tuned_res_wgrad is None:
         inp_indices = pair_in[profile_idx].slice_first_axis(0, nhot_profile)
@@ -1349,7 +1542,8 @@ def indice_conv_backward(features: torch.Tensor,
             beta=0.0,
             hint=AlgoHint.BackwardWeight.value,
             stream=stream,
-            use_tf32=constants.SPCONV_ALLOW_TF32)
+            use_tf32=constants.SPCONV_ALLOW_TF32,
+        )
         # print(tuned_res_wgrad.algo_desp, tuned_res_wgrad.splitk, min_time)
     # get workspace size for wgrad
     if is_KC_not_CK:
@@ -1358,25 +1552,28 @@ def indice_conv_backward(features: torch.Tensor,
     else:
         b_shape = [maxnhot, out_bp_tv.dim(1)]
         a_shape = [maxnhot, features_tv.dim(1)]
-    m, n, k = GEMM.extract_mnk(a_shape,
-                               b_shape,
-                               tuned_res_wgrad.algo_desp.trans_a,
-                               tuned_res_wgrad.algo_desp.trans_b,
-                               tuned_res_wgrad.algo_desp.trans_c,
-                               arch=arch,
-                               shuffle_type=ShuffleStrideType.ShuffleAB,
-                               a_inds_shape=[maxnhot],
-                               b_inds_shape=[maxnhot],
-                               hint=AlgoHint.BackwardWeight.value)
+    m, n, k = GEMM.extract_mnk(
+        a_shape,
+        b_shape,
+        tuned_res_wgrad.algo_desp.trans_a,
+        tuned_res_wgrad.algo_desp.trans_b,
+        tuned_res_wgrad.algo_desp.trans_c,
+        arch=arch,
+        shuffle_type=ShuffleStrideType.ShuffleAB,
+        a_inds_shape=[maxnhot],
+        b_inds_shape=[maxnhot],
+        hint=AlgoHint.BackwardWeight.value,
+    )
     workspace_size = tuned_res_wgrad.algo_desp.query_workspace_size(
-        m, n, k, tuned_res_wgrad.splitk)
+        m, n, k, tuned_res_wgrad.splitk
+    )
     workspace = torch.Tensor()
 
     workspace_tv = tv.Tensor()
     if workspace_size > 0:
-        workspace = torch.empty((workspace_size, ),
-                                dtype=torch.int8,
-                                device=features.device)
+        workspace = torch.empty(
+            (workspace_size,), dtype=torch.int8, device=features.device
+        )
         workspace_tv = torch_tensor_to_tv(workspace)
     # print(workspace_size, m, n, k, tuned_res_wgrad.splitk)
     # torch.cuda.synchronize()
@@ -1395,21 +1592,23 @@ def indice_conv_backward(features: torch.Tensor,
         out_indices = pair_out[i].slice_first_axis(0, nhot)
         # out.T @ inp, NK @ NC
         filter_i_tv = filters_tv.select(kv_dim, i)
-        GEMM.run_with_tuned_result(tuned_res_dgrad,
-                                   out_bp_tv,
-                                   filter_i_tv,
-                                   din_tv,
-                                   False,
-                                   not is_KC_not_CK,
-                                   False,
-                                   arch=arch,
-                                   stream=stream,
-                                   shuffle_type=ShuffleStrideType.ShuffleAC,
-                                   a_inds=out_indices,
-                                   c_inds=inp_indices,
-                                   hint=AlgoHint.BackwardInput.value,
-                                   alpha=1.0,
-                                   beta=beta)
+        GEMM.run_with_tuned_result(
+            tuned_res_dgrad,
+            out_bp_tv,
+            filter_i_tv,
+            din_tv,
+            False,
+            not is_KC_not_CK,
+            False,
+            arch=arch,
+            stream=stream,
+            shuffle_type=ShuffleStrideType.ShuffleAC,
+            a_inds=out_indices,
+            c_inds=inp_indices,
+            hint=AlgoHint.BackwardInput.value,
+            alpha=1.0,
+            beta=beta,
+        )
 
         if is_KC_not_CK:
             a = out_bp_tv
@@ -1421,22 +1620,24 @@ def indice_conv_backward(features: torch.Tensor,
             b = out_bp_tv
             a_inds = inp_indices
             b_inds = out_indices
-        GEMM.run_with_tuned_result(tuned_res_wgrad,
-                                   a,
-                                   b,
-                                   dfilters_tv.select(kv_dim, i),
-                                   True,
-                                   False,
-                                   False,
-                                   arch=arch,
-                                   stream=stream,
-                                   shuffle_type=ShuffleStrideType.ShuffleAB,
-                                   a_inds=a_inds,
-                                   b_inds=b_inds,
-                                   hint=AlgoHint.BackwardWeight.value,
-                                   alpha=1.0,
-                                   beta=beta,
-                                   workspace=workspace_tv)
+        GEMM.run_with_tuned_result(
+            tuned_res_wgrad,
+            a,
+            b,
+            dfilters_tv.select(kv_dim, i),
+            True,
+            False,
+            False,
+            arch=arch,
+            stream=stream,
+            shuffle_type=ShuffleStrideType.ShuffleAB,
+            a_inds=a_inds,
+            b_inds=b_inds,
+            hint=AlgoHint.BackwardWeight.value,
+            alpha=1.0,
+            beta=beta,
+            workspace=workspace_tv,
+        )
         inited = True
 
     # torch.cuda.synchronize()
@@ -1447,26 +1648,28 @@ def indice_conv_backward(features: torch.Tensor,
     return (din, dfilters.reshape(filters_shape))
 
 
-def implicit_gemm(features: torch.Tensor,
-                  filters: torch.Tensor,
-                  pair_fwd: torch.Tensor,
-                  pair_mask_fwd_splits: List[torch.Tensor],
-                  mask_argsort_fwd_splits: List[torch.Tensor],
-                  num_activate_out: int,
-                  masks: List[np.ndarray],
-                  is_train: bool,
-                  is_subm: bool,
-                  timer: CUDAKernelTimer = CUDAKernelTimer(False),
-                  fp32_accum: Optional[bool] = None,
-                  bias: Optional[torch.Tensor] = None,
-                  act_alpha: float = 0.0,
-                  act_beta: float = 0.0,
-                  act_type: tv.gemm.Activation = tv.gemm.Activation.None_,
-                  output_scale: float = 1.0,
-                  scale: Optional[torch.Tensor] = None,
-                  output_add: Optional[torch.Tensor] = None,
-                  output_add_scale: float = 0.0,
-                  output_dtype: Optional[torch.dtype] = None):
+def implicit_gemm(
+    features: torch.Tensor,
+    filters: torch.Tensor,
+    pair_fwd: torch.Tensor,
+    pair_mask_fwd_splits: List[torch.Tensor],
+    mask_argsort_fwd_splits: List[torch.Tensor],
+    num_activate_out: int,
+    masks: List[np.ndarray],
+    is_train: bool,
+    is_subm: bool,
+    timer: CUDAKernelTimer = CUDAKernelTimer(False),
+    fp32_accum: Optional[bool] = None,
+    bias: Optional[torch.Tensor] = None,
+    act_alpha: float = 0.0,
+    act_beta: float = 0.0,
+    act_type: tv.gemm.Activation = tv.gemm.Activation.None_,
+    output_scale: float = 1.0,
+    scale: Optional[torch.Tensor] = None,
+    output_add: Optional[torch.Tensor] = None,
+    output_add_scale: float = 0.0,
+    output_dtype: Optional[torch.dtype] = None,
+):
     stream = get_current_stream()
     bias_tv = tv.Tensor()
     scale_tv = tv.Tensor()
@@ -1480,7 +1683,7 @@ def implicit_gemm(features: torch.Tensor,
         scale_tv = torch_tensor_to_tv(scale)
     if output_add is not None:
         output_add_tv = torch_tensor_to_tv(output_add)
-    
+
     if not features.is_contiguous():
         features = features.contiguous()
     assert features.is_contiguous()
@@ -1511,13 +1714,33 @@ def implicit_gemm(features: torch.Tensor,
         arch = get_arch()
         output_dtype_tv = _TORCH_DTYPE_TO_TV[output_dtype]
         mask_width, tune_res_cpp = ConvGemmOps.implicit_gemm(
-            alloc, CONV_CPP, features_tv, filters_tv, pair_fwd_tv,
-            pair_mask_fwd_splits_tv, mask_argsort_fwd_splits_tv,
-            num_activate_out, mask_tv, arch, is_train, is_subm, stream,
-            timer_cpp, auto_fp32_accum, fp32_accum, bias_tv, act_alpha, act_beta, act_type,
-            use_tf32=constants.SPCONV_ALLOW_TF32, output_scale=output_scale,
-            scale=scale_tv, output_add=output_add_tv, output_add_scale=output_add_scale,
-            output_dtype=output_dtype_tv)
+            alloc,
+            CONV_CPP,
+            features_tv,
+            filters_tv,
+            pair_fwd_tv,
+            pair_mask_fwd_splits_tv,
+            mask_argsort_fwd_splits_tv,
+            num_activate_out,
+            mask_tv,
+            arch,
+            is_train,
+            is_subm,
+            stream,
+            timer_cpp,
+            auto_fp32_accum,
+            fp32_accum,
+            bias_tv,
+            act_alpha,
+            act_beta,
+            act_type,
+            use_tf32=constants.SPCONV_ALLOW_TF32,
+            output_scale=output_scale,
+            scale=scale_tv,
+            output_add=output_add_tv,
+            output_add_scale=output_add_scale,
+            output_dtype=output_dtype_tv,
+        )
         out_features = alloc.allocated[AllocKeys.OutFeatures]
         mask_output_fwd = alloc.allocated.get(AllocKeys.MaskOutputFwd, None)
         if is_train:
@@ -1541,14 +1764,24 @@ def implicit_gemm(features: torch.Tensor,
     mask_int_count = div_up(kv, 32)
     if is_int8:
         if is_subm:
-            out_features = torch._empty_affine_quantized(size=(num_activate_out, out_channel), 
-                scale=output_scale, zero_point=0, dtype=features.dtype, device=features.device)
+            out_features = torch._empty_affine_quantized(
+                size=(num_activate_out, out_channel),
+                scale=output_scale,
+                zero_point=0,
+                dtype=features.dtype,
+                device=features.device,
+            )
             # out_features = torch.empty((num_activate_out, out_channel),
             #                         dtype=output_dtype,
             #                         device=features.device)
         else:
-            out_features = torch._empty_affine_quantized(size=(num_activate_out, out_channel), 
-                scale=output_scale, zero_point=0, dtype=features.dtype, device=features.device)
+            out_features = torch._empty_affine_quantized(
+                size=(num_activate_out, out_channel),
+                scale=output_scale,
+                zero_point=0,
+                dtype=features.dtype,
+                device=features.device,
+            )
             ctx = tv.Context()
             ctx.set_cuda_stream(stream)
             torch_tensor_to_tv(out_features).zero_(ctx)
@@ -1557,13 +1790,17 @@ def implicit_gemm(features: torch.Tensor,
             #                         device=features.device)
     else:
         if is_subm:
-            out_features = torch.empty((num_activate_out, out_channel),
-                                    dtype=output_dtype,
-                                    device=features.device)
+            out_features = torch.empty(
+                (num_activate_out, out_channel),
+                dtype=output_dtype,
+                device=features.device,
+            )
         else:
-            out_features = torch.zeros((num_activate_out, out_channel),
-                                    dtype=output_dtype,
-                                    device=features.device)
+            out_features = torch.zeros(
+                (num_activate_out, out_channel),
+                dtype=output_dtype,
+                device=features.device,
+            )
     pair_fwd_tv = torch_tensor_to_tv(pair_fwd)
     features_tv = torch_tensor_to_tv(features)
     filters_tv = torch_tensor_to_tv(filters)
@@ -1578,9 +1815,15 @@ def implicit_gemm(features: torch.Tensor,
     # CONV.stream_synchronize(stream)
     # t = time.time()
 
-    tune_res = CONV.get_tuned_algo(ConvOpType.kForward, features_tv.dtype,
-                                   filters_tv.dtype, out_features_tv.dtype,
-                                   out_channel, in_channel, arch)
+    tune_res = CONV.get_tuned_algo(
+        ConvOpType.kForward,
+        features_tv.dtype,
+        filters_tv.dtype,
+        out_features_tv.dtype,
+        out_channel,
+        in_channel,
+        arch,
+    )
     if tune_res is None:
         tune_res, _ = CONV.tune_and_cache(
             ConvOpType.kForward,
@@ -1599,18 +1842,19 @@ def implicit_gemm(features: torch.Tensor,
             stream=stream,
             fp32_accum=fp32_accum,
             use_tf32=constants.SPCONV_ALLOW_TF32,
-            bias=bias_tv, scale=scale_tv)
+            bias=bias_tv,
+            scale=scale_tv,
+        )
 
     mask_width = tune_res.algo_desp.tile_shape[0]
     if is_train:
         mask_output_fwd = torch.empty(
-            [num_split,
-             codeops.div_up(num_activate_out, mask_width), mask_int_count],
+            [num_split, codeops.div_up(num_activate_out, mask_width), mask_int_count],
             dtype=torch.int32,
-            device=features.device)
+            device=features.device,
+        )
         # pytorch don't support uint32.
-        mask_output_fwd_tv = torch_tensor_to_tv(mask_output_fwd,
-                                                dtype=tv.uint32)
+        mask_output_fwd_tv = torch_tensor_to_tv(mask_output_fwd, dtype=tv.uint32)
         mask_output_fwd_tvs = [mask_output_fwd_tv[j] for j in range(num_split)]
     else:
         mask_output_fwd = None
@@ -1635,7 +1879,7 @@ def implicit_gemm(features: torch.Tensor,
         for j in range(num_split):
             beta = 0 if j == 0 else 1
             if bias is not None and not tune_res.algo_desp.is_int8_inference:
-                beta = 1 
+                beta = 1
             if output_add is not None and tune_res.algo_desp.is_int8_inference:
                 beta = output_add_scale / output_scale
             CONV.run_with_tuned_result(
@@ -1660,25 +1904,28 @@ def implicit_gemm(features: torch.Tensor,
                 act_alpha=act_alpha,
                 act_beta=act_beta,
                 scale=scale_tv,
-                output_add=output_add_tv)
+                output_add=output_add_tv,
+            )
     return out_features, mask_output_fwd, mask_width
 
 
-def implicit_gemm_backward(features: torch.Tensor,
-                           filters: torch.Tensor,
-                           out_bp: torch.Tensor,
-                           pair_fwd: torch.Tensor,
-                           pair_bwd: torch.Tensor,
-                           pair_mask_fwd_splits: List[torch.Tensor],
-                           pair_mask_bwd_splits: List[torch.Tensor],
-                           mask_argsort_fwd_splits: List[torch.Tensor],
-                           mask_argsort_bwd_splits: List[torch.Tensor],
-                           mask_output_fwd: Optional[torch.Tensor],
-                           masks: List[np.ndarray],
-                           mask_width: int,
-                           is_subm: bool,
-                           timer: CUDAKernelTimer = CUDAKernelTimer(False),
-                           fp32_accum: Optional[bool] = None):
+def implicit_gemm_backward(
+    features: torch.Tensor,
+    filters: torch.Tensor,
+    out_bp: torch.Tensor,
+    pair_fwd: torch.Tensor,
+    pair_bwd: torch.Tensor,
+    pair_mask_fwd_splits: List[torch.Tensor],
+    pair_mask_bwd_splits: List[torch.Tensor],
+    mask_argsort_fwd_splits: List[torch.Tensor],
+    mask_argsort_bwd_splits: List[torch.Tensor],
+    mask_output_fwd: Optional[torch.Tensor],
+    masks: List[np.ndarray],
+    mask_width: int,
+    is_subm: bool,
+    timer: CUDAKernelTimer = CUDAKernelTimer(False),
+    fp32_accum: Optional[bool] = None,
+):
     # print(out_bp.mean(), out_bp.max(), out_bp.min())
     if features.dtype == torch.int8 or features.dtype == torch.qint8:
         raise NotImplementedError("work in progress")
@@ -1700,12 +1947,8 @@ def implicit_gemm_backward(features: torch.Tensor,
         pair_fwd_tv = torch_tensor_to_tv(pair_fwd)
         pair_bwd_tv = torch_tensor_to_tv(pair_bwd)
 
-        pair_mask_fwd_splits_tv = [
-            torch_tensor_to_tv(t) for t in pair_mask_fwd_splits
-        ]
-        pair_mask_bwd_splits_tv = [
-            torch_tensor_to_tv(t) for t in pair_mask_bwd_splits
-        ]
+        pair_mask_fwd_splits_tv = [torch_tensor_to_tv(t) for t in pair_mask_fwd_splits]
+        pair_mask_bwd_splits_tv = [torch_tensor_to_tv(t) for t in pair_mask_bwd_splits]
 
         mask_argsort_fwd_splits_tv = [
             torch_tensor_to_tv(t) for t in mask_argsort_fwd_splits
@@ -1731,12 +1974,28 @@ def implicit_gemm_backward(features: torch.Tensor,
         arch = get_arch()
 
         ConvGemmOps.implicit_gemm_backward(
-            alloc, CONV_CPP, features_tv, filters_tv, out_bp_tv, pair_fwd_tv,
-            pair_bwd_tv, pair_mask_fwd_splits_tv, pair_mask_bwd_splits_tv,
-            mask_argsort_fwd_splits_tv, mask_argsort_bwd_splits_tv,
-            mask_output_fwd_tv, mask_tv, arch, mask_width, is_subm, stream,
-            timer_cpp, auto_fp32_accum, fp32_accum,
-            use_tf32=constants.SPCONV_ALLOW_TF32)
+            alloc,
+            CONV_CPP,
+            features_tv,
+            filters_tv,
+            out_bp_tv,
+            pair_fwd_tv,
+            pair_bwd_tv,
+            pair_mask_fwd_splits_tv,
+            pair_mask_bwd_splits_tv,
+            mask_argsort_fwd_splits_tv,
+            mask_argsort_bwd_splits_tv,
+            mask_output_fwd_tv,
+            mask_tv,
+            arch,
+            mask_width,
+            is_subm,
+            stream,
+            timer_cpp,
+            auto_fp32_accum,
+            fp32_accum,
+            use_tf32=constants.SPCONV_ALLOW_TF32,
+        )
         din = alloc.allocated[AllocKeys.DIn]
         dfilters = alloc.allocated[AllocKeys.DFilters]
         return din, dfilters
@@ -1782,15 +2041,27 @@ def implicit_gemm_backward(features: torch.Tensor,
         torch_tensor_to_tv(x) for x in mask_argsort_bwd_splits
     ]
 
-    dgrad_tune_res = CONV.get_tuned_algo(ConvOpType.kBackwardInput,
-                                         din_tv.dtype, filters_tv.dtype,
-                                         dout_tv.dtype, out_channel,
-                                         in_channel, arch, need_dynamic_mask=need_dynamic_mask)
-    wgrad_tune_res = CONV.get_tuned_algo(ConvOpType.kBackwardWeight,
-                                         features_tv.dtype, dfilters_tv.dtype,
-                                         dout_tv.dtype, out_channel,
-                                         in_channel, arch, mask_width,
-                                         need_dynamic_mask=need_dynamic_mask)
+    dgrad_tune_res = CONV.get_tuned_algo(
+        ConvOpType.kBackwardInput,
+        din_tv.dtype,
+        filters_tv.dtype,
+        dout_tv.dtype,
+        out_channel,
+        in_channel,
+        arch,
+        need_dynamic_mask=need_dynamic_mask,
+    )
+    wgrad_tune_res = CONV.get_tuned_algo(
+        ConvOpType.kBackwardWeight,
+        features_tv.dtype,
+        dfilters_tv.dtype,
+        dout_tv.dtype,
+        out_channel,
+        in_channel,
+        arch,
+        mask_width,
+        need_dynamic_mask=need_dynamic_mask,
+    )
 
     if dgrad_tune_res is None:
         # TODO split mask maybe completely invalid
@@ -1801,22 +2072,24 @@ def implicit_gemm_backward(features: torch.Tensor,
             mask = pair_mask_bwd_split_tvs[0]
             mask_argsort = mask_argsort_bwd_split_tvs[0]
 
-        dgrad_tune_res, _ = CONV.tune_and_cache(ConvOpType.kBackwardInput,
-                                                din_tv,
-                                                filters_tv,
-                                                dout_tv,
-                                                NHWC,
-                                                KRSC,
-                                                NHWC,
-                                                arch,
-                                                mask=mask,
-                                                mask_argsort=mask_argsort,
-                                                indices=pair_bwd_tv,
-                                                reverse_mask=is_subm,
-                                                mask_filter=masks[0].item(),
-                                                stream=stream,
-                                                fp32_accum=fp32_accum,
-                                                use_tf32=constants.SPCONV_ALLOW_TF32)
+        dgrad_tune_res, _ = CONV.tune_and_cache(
+            ConvOpType.kBackwardInput,
+            din_tv,
+            filters_tv,
+            dout_tv,
+            NHWC,
+            KRSC,
+            NHWC,
+            arch,
+            mask=mask,
+            mask_argsort=mask_argsort,
+            indices=pair_bwd_tv,
+            reverse_mask=is_subm,
+            mask_filter=masks[0].item(),
+            stream=stream,
+            fp32_accum=fp32_accum,
+            use_tf32=constants.SPCONV_ALLOW_TF32,
+        )
     if wgrad_tune_res is None:
         wgrad_tune_res, _ = CONV.tune_and_cache(
             ConvOpType.kBackwardWeight,
@@ -1835,19 +2108,24 @@ def implicit_gemm_backward(features: torch.Tensor,
             mask_output=tv.Tensor(),
             mask_width=mask_width,
             stream=stream,
-            use_tf32=constants.SPCONV_ALLOW_TF32)
-    workspace_size = CONV.query_workspace_size(wgrad_tune_res.algo_desp,
-                                               wgrad_tune_res.splitk,
-                                               ConvOpType.kBackwardWeight,
-                                               pair_fwd_tv.dim(1), in_channel,
-                                               out_channel, kv)
+            use_tf32=constants.SPCONV_ALLOW_TF32,
+        )
+    workspace_size = CONV.query_workspace_size(
+        wgrad_tune_res.algo_desp,
+        wgrad_tune_res.splitk,
+        ConvOpType.kBackwardWeight,
+        pair_fwd_tv.dim(1),
+        in_channel,
+        out_channel,
+        kv,
+    )
     workspace = torch.Tensor()
 
     workspace_tv = tv.Tensor()
     if workspace_size > 0:
-        workspace = torch.empty((workspace_size, ),
-                                dtype=torch.int8,
-                                device=features.device)
+        workspace = torch.empty(
+            (workspace_size,), dtype=torch.int8, device=features.device
+        )
         workspace_tv = torch_tensor_to_tv(workspace)
     with timer.record("implicit_gemm_backward", stream):
         for j in range(num_split):
@@ -1859,20 +2137,22 @@ def implicit_gemm_backward(features: torch.Tensor,
                 mask = pair_mask_bwd_split_tvs[j]
                 mask_argsort = mask_argsort_bwd_split_tvs[j]
 
-            CONV.run_with_tuned_result(dgrad_tune_res,
-                                       ConvOpType.kBackwardInput,
-                                       din_tv,
-                                       filters_tv,
-                                       dout_tv,
-                                       mask=mask,
-                                       mask_argsort=mask_argsort,
-                                       mask_output=tv.Tensor(),
-                                       indices=pair_bwd_tv,
-                                       reverse_mask=is_subm,
-                                       mask_filter=masks[j].item(),
-                                       mask_width=-1,
-                                       beta=beta,
-                                       stream=stream)
+            CONV.run_with_tuned_result(
+                dgrad_tune_res,
+                ConvOpType.kBackwardInput,
+                din_tv,
+                filters_tv,
+                dout_tv,
+                mask=mask,
+                mask_argsort=mask_argsort,
+                mask_output=tv.Tensor(),
+                indices=pair_bwd_tv,
+                reverse_mask=is_subm,
+                mask_filter=masks[j].item(),
+                mask_width=-1,
+                beta=beta,
+                stream=stream,
+            )
             # for backward weight, beta = 0 because each split
             # handle different kernel locations.
             # TODO remove D iterator in backward weight kernel
@@ -1891,13 +2171,18 @@ def implicit_gemm_backward(features: torch.Tensor,
                 mask_width=mask_width,
                 beta=0,
                 workspace=workspace_tv,
-                stream=stream)
+                stream=stream,
+            )
 
     return (din, dfilters.reshape(filters_shape))
 
 
-def indice_maxpool(features: torch.Tensor, indice_pairs: torch.Tensor,
-                   indice_pair_num: torch.Tensor, num_activate_out):
+def indice_maxpool(
+    features: torch.Tensor,
+    indice_pairs: torch.Tensor,
+    indice_pair_num: torch.Tensor,
+    num_activate_out,
+):
     # torch.cuda.synchronize()
     # t = time.time()
     # stream = get_current_stream()
@@ -1907,9 +2192,9 @@ def indice_maxpool(features: torch.Tensor, indice_pairs: torch.Tensor,
         features = features.contiguous()
 
     out_channel = features.shape[-1]
-    out_features = torch.zeros((num_activate_out, out_channel),
-                               dtype=features.dtype,
-                               device=features.device)
+    out_features = torch.zeros(
+        (num_activate_out, out_channel), dtype=features.dtype, device=features.device
+    )
     stream = 0
     is_cpu = not features.is_cuda
     if not is_cpu:
@@ -1924,11 +2209,13 @@ def indice_maxpool(features: torch.Tensor, indice_pairs: torch.Tensor,
         inp_indices = indice_pairs_tv[0][i].slice_first_axis(0, nhot)
         out_indices = indice_pairs_tv[1][i].slice_first_axis(0, nhot)
         if is_cpu:
-            SpconvOps.maxpool_forward_cpu(out_features_tv, features_tv,
-                                          out_indices, inp_indices)
+            SpconvOps.maxpool_forward_cpu(
+                out_features_tv, features_tv, out_indices, inp_indices
+            )
         else:
-            SpconvOps.maxpool_forward(out_features_tv, features_tv,
-                                      out_indices, inp_indices, stream)
+            SpconvOps.maxpool_forward(
+                out_features_tv, features_tv, out_indices, inp_indices, stream
+            )
 
     # CONV.stream_synchronize(stream)
     # print("M", time.time() - t)
@@ -1936,8 +2223,9 @@ def indice_maxpool(features: torch.Tensor, indice_pairs: torch.Tensor,
     return out_features
 
 
-def indice_maxpool_backward(features, out_features, out_bp, indice_pairs,
-                            indice_pair_num):
+def indice_maxpool_backward(
+    features, out_features, out_bp, indice_pairs, indice_pair_num
+):
     out_channel = features.shape[-1]
     din = torch.zeros_like(features)
     is_cpu = not features.is_cuda
@@ -1961,19 +2249,31 @@ def indice_maxpool_backward(features, out_features, out_bp, indice_pairs,
         inp_indices = indice_pairs_tv[0][i].slice_first_axis(0, nhot)
         out_indices = indice_pairs_tv[1][i].slice_first_axis(0, nhot)
         if is_cpu:
-            SpconvOps.maxpool_backward_cpu(out_features_tv, features_tv,
-                                           out_bp_tv, din_tv, out_indices,
-                                           inp_indices)
+            SpconvOps.maxpool_backward_cpu(
+                out_features_tv,
+                features_tv,
+                out_bp_tv,
+                din_tv,
+                out_indices,
+                inp_indices,
+            )
         else:
-            SpconvOps.maxpool_backward(out_features_tv, features_tv, out_bp_tv,
-                                       din_tv, out_indices, inp_indices,
-                                       stream)
+            SpconvOps.maxpool_backward(
+                out_features_tv,
+                features_tv,
+                out_bp_tv,
+                din_tv,
+                out_indices,
+                inp_indices,
+                stream,
+            )
 
     return din
 
 
-def indice_maxpool_implicit_gemm(features: torch.Tensor,
-                                 indice_pairs: torch.Tensor, num_activate_out):
+def indice_maxpool_implicit_gemm(
+    features: torch.Tensor, indice_pairs: torch.Tensor, num_activate_out
+):
     # torch.cuda.synchronize()
     # t = time.time()
     stream = get_current_stream()
@@ -1984,21 +2284,26 @@ def indice_maxpool_implicit_gemm(features: torch.Tensor,
 
     out_channel = features.shape[-1]
     if features.is_quantized:
-        out_features = torch._empty_affine_quantized((num_activate_out, out_channel),
-                                scale=features.q_scale(),
-                                dtype=features.dtype,
-                                device=features.device)
+        out_features = torch._empty_affine_quantized(
+            (num_activate_out, out_channel),
+            scale=features.q_scale(),
+            dtype=features.dtype,
+            device=features.device,
+        )
     else:
-        out_features = torch.empty((num_activate_out, out_channel),
-                                dtype=features.dtype,
-                                device=features.device)
+        out_features = torch.empty(
+            (num_activate_out, out_channel),
+            dtype=features.dtype,
+            device=features.device,
+        )
     assert features.is_cuda
     stream = get_current_stream()
     out_features_tv = torch_tensor_to_tv(out_features)
     features_tv = torch_tensor_to_tv(features)
     indice_pairs_tv = torch_tensor_to_tv(indice_pairs)
-    SpconvOps.maxpool_implicit_gemm_forward(out_features_tv, features_tv,
-                                            indice_pairs_tv, stream)
+    SpconvOps.maxpool_implicit_gemm_forward(
+        out_features_tv, features_tv, indice_pairs_tv, stream
+    )
 
     # CONV.stream_synchronize(stream)
     # print("M", time.time() - t)
@@ -2006,8 +2311,7 @@ def indice_maxpool_implicit_gemm(features: torch.Tensor,
     return out_features
 
 
-def indice_maxpool_implicit_gemm_backward(features, out_features, out_bp,
-                                          indice_pairs):
+def indice_maxpool_implicit_gemm_backward(features, out_features, out_bp, indice_pairs):
     # torch.cuda.synchronize()
     # t = time.time()
     out_channel = features.shape[-1]
@@ -2024,15 +2328,18 @@ def indice_maxpool_implicit_gemm_backward(features, out_features, out_bp,
     out_bp_tv = torch_tensor_to_tv(out_bp)
     din_tv = torch_tensor_to_tv(din)
     indice_pairs_tv = torch_tensor_to_tv(indice_pairs)
-    SpconvOps.maxpool_implicit_gemm_backward(out_features_tv, features_tv,
-                                             out_bp_tv, din_tv,
-                                             indice_pairs_tv, stream)
+    SpconvOps.maxpool_implicit_gemm_backward(
+        out_features_tv, features_tv, out_bp_tv, din_tv, indice_pairs_tv, stream
+    )
     return din
 
 
-def indice_avgpool_implicit_gemm(features: torch.Tensor,
-                                 indice_pairs: torch.Tensor, num_activate_out,
-                                 calc_count: bool):
+def indice_avgpool_implicit_gemm(
+    features: torch.Tensor,
+    indice_pairs: torch.Tensor,
+    num_activate_out,
+    calc_count: bool,
+):
     # torch.cuda.synchronize()
     # t = time.time()
     stream = get_current_stream()
@@ -2043,14 +2350,18 @@ def indice_avgpool_implicit_gemm(features: torch.Tensor,
 
     out_channel = features.shape[-1]
     if features.is_quantized:
-        out_features = torch._empty_affine_quantized((num_activate_out, out_channel),
-                                scale=features.q_scale(),
-                                dtype=features.dtype,
-                                device=features.device)
+        out_features = torch._empty_affine_quantized(
+            (num_activate_out, out_channel),
+            scale=features.q_scale(),
+            dtype=features.dtype,
+            device=features.device,
+        )
     else:
-        out_features = torch.empty((num_activate_out, out_channel),
-                                dtype=features.dtype,
-                                device=features.device)
+        out_features = torch.empty(
+            (num_activate_out, out_channel),
+            dtype=features.dtype,
+            device=features.device,
+        )
 
     assert features.is_cuda
     stream = get_current_stream()
@@ -2060,13 +2371,13 @@ def indice_avgpool_implicit_gemm(features: torch.Tensor,
     count_out = torch.Tensor()
     count_out_tv = tv.Tensor()
     if calc_count:
-        count_out = torch.zeros((num_activate_out, ),
-                                dtype=torch.int32,
-                                device=features.device)
+        count_out = torch.zeros(
+            (num_activate_out,), dtype=torch.int32, device=features.device
+        )
         count_out_tv = torch_tensor_to_tv(count_out)
-    SpconvOps.avgpool_implicit_gemm_forward(out_features_tv, features_tv,
-                                            indice_pairs_tv, count_out_tv,
-                                            stream)
+    SpconvOps.avgpool_implicit_gemm_forward(
+        out_features_tv, features_tv, indice_pairs_tv, count_out_tv, stream
+    )
 
     # CONV.stream_synchronize(stream)
     # print("M", time.time() - t)
@@ -2078,9 +2389,11 @@ def indice_avgpool_implicit_gemm_backward(out_bp, indice_pairs, count_out):
     # torch.cuda.synchronize()
     # t = time.time()
     out_channel = out_bp.shape[-1]
-    din = torch.zeros((indice_pairs.shape[1], out_bp.shape[1]),
-                      dtype=out_bp.dtype,
-                      device=out_bp.device)
+    din = torch.zeros(
+        (indice_pairs.shape[1], out_bp.shape[1]),
+        dtype=out_bp.dtype,
+        device=out_bp.device,
+    )
     assert out_bp.is_cuda
     if not out_bp.is_contiguous():
         out_bp = out_bp.contiguous()
@@ -2090,9 +2403,9 @@ def indice_avgpool_implicit_gemm_backward(out_bp, indice_pairs, count_out):
     out_bp_tv = torch_tensor_to_tv(out_bp)
     din_tv = torch_tensor_to_tv(din)
     indice_pairs_tv = torch_tensor_to_tv(indice_pairs)
-    SpconvOps.avgpool_implicit_gemm_backward(out_bp_tv, din_tv,
-                                             indice_pairs_tv, count_out_tv,
-                                             stream)
+    SpconvOps.avgpool_implicit_gemm_backward(
+        out_bp_tv, din_tv, indice_pairs_tv, count_out_tv, stream
+    )
     return din
 
 
