@@ -206,8 +206,6 @@ class SparseConvTensor(metaclass=SpConvTensorMeta):
         if permanent_thrust_allocator:
             self.thrust_allocator = ThrustSortAllocator(features.device)
 
-        if CPU_ONLY_BUILD:
-            input._timer = None
         self.force_algo = force_algo
         self.int8_scale: Optional[np.ndarray] = None
 

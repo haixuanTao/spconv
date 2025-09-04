@@ -15,73 +15,70 @@
 
 import pccm
 from pccm.utils import project_is_editable, project_is_installed
-from ccimport.compat import InMacOS
-from .constants import PACKAGE_NAME, PACKAGE_ROOT, DISABLE_JIT, SPCONV_INT8_DEBUG
 
-if project_is_installed(PACKAGE_NAME) and project_is_editable(
-        PACKAGE_NAME) and not DISABLE_JIT and not SPCONV_INT8_DEBUG:
-    from spconv.core import SHUFFLE_SIMT_PARAMS, SHUFFLE_VOLTA_PARAMS, SHUFFLE_TURING_PARAMS, SHUFFLE_AMPERE_PARAMS
-    from spconv.core import IMPLGEMM_SIMT_PARAMS, IMPLGEMM_VOLTA_PARAMS, IMPLGEMM_TURING_PARAMS, IMPLGEMM_AMPERE_PARAMS
+from .constants import DISABLE_JIT, PACKAGE_NAME, PACKAGE_ROOT, SPCONV_INT8_DEBUG
 
-    from cumm.gemm.main import GemmMainUnitTest
-    from cumm.conv.main import ConvMainUnitTest
+if (
+    project_is_installed(PACKAGE_NAME)
+    and project_is_editable(PACKAGE_NAME)
+    and not DISABLE_JIT
+    and not SPCONV_INT8_DEBUG
+):
     from cumm.common import CompileInfo
+    from cumm.gemm.main import GemmMainUnitTest
 
+    from spconv.core import (
+        IMPLGEMM_AMPERE_PARAMS,
+        IMPLGEMM_SIMT_PARAMS,
+        IMPLGEMM_TURING_PARAMS,
+        IMPLGEMM_VOLTA_PARAMS,
+        SHUFFLE_AMPERE_PARAMS,
+        SHUFFLE_SIMT_PARAMS,
+        SHUFFLE_TURING_PARAMS,
+        SHUFFLE_VOLTA_PARAMS,
+    )
+    from spconv.csrc.hash.core import HashTable
     from spconv.csrc.sparse.all import SpconvOps
     from spconv.csrc.sparse.alloc import ExternalAllocator
-    from spconv.csrc.utils import BoxOps, PointCloudCompress
-    from spconv.csrc.hash.core import HashTable
-    from spconv.csrc.sparse.convops import GemmTunerSimple, ExternalSpconvMatmul
-    from spconv.csrc.sparse.convops import ConvTunerSimple, ConvGemmOps
-    from spconv.csrc.sparse.convops import SimpleExternalSpconvMatmul
+    from spconv.csrc.sparse.convops import (
+        ExternalSpconvMatmul,
+    )
     from spconv.csrc.sparse.inference import InferenceOps
+    from spconv.csrc.utils import BoxOps, PointCloudCompress
 
-    all_shuffle = SHUFFLE_SIMT_PARAMS + SHUFFLE_VOLTA_PARAMS + SHUFFLE_TURING_PARAMS + SHUFFLE_AMPERE_PARAMS
+    all_shuffle = (
+        SHUFFLE_SIMT_PARAMS
+        + SHUFFLE_VOLTA_PARAMS
+        + SHUFFLE_TURING_PARAMS
+        + SHUFFLE_AMPERE_PARAMS
+    )
     # all_shuffle = list(filter(lambda x: not x.is_nvrtc, all_shuffle))
     cu = GemmMainUnitTest(all_shuffle)
     cu.namespace = "cumm.gemm.main"
-    all_imp = (IMPLGEMM_SIMT_PARAMS + IMPLGEMM_VOLTA_PARAMS +
-               IMPLGEMM_TURING_PARAMS + IMPLGEMM_AMPERE_PARAMS)
-    # all_imp = list(filter(lambda x: not x.is_nvrtc, all_imp))
-    convcu = ConvMainUnitTest(all_imp)
-    convcu.namespace = "cumm.conv.main"
-    gemmtuner = GemmTunerSimple(cu)
-    gemmtuner.namespace = "csrc.sparse.convops.gemmops"
-    convtuner = ConvTunerSimple(convcu)
-    convtuner.namespace = "csrc.sparse.convops.convops"
-    convops = ConvGemmOps(gemmtuner, convtuner)
-    convops.namespace = "csrc.sparse.convops.spops"
-
-    if InMacOS:
-        cus = [
-            SpconvOps(),
-            BoxOps(),
-            HashTable(),
-            CompileInfo(),
-            ExternalAllocator(),
-            ExternalSpconvMatmul(),
-            InferenceOps(),
-            PointCloudCompress(),
-        ] 
-    else:   
-        cus = [
-            cu, convcu, gemmtuner, convtuner,
-            convops,
-            SpconvOps(),
-            BoxOps(),
-            HashTable(),
-            CompileInfo(),
-            ExternalAllocator(),
-            ExternalSpconvMatmul(),
-            SimpleExternalSpconvMatmul(), # for debug, won't be included in release
-            InferenceOps(),
-            PointCloudCompress(),
-        ]
-    pccm.builder.build_pybind(cus,
-                              PACKAGE_ROOT / "core_cc",
-                              namespace_root=PACKAGE_ROOT,
-                              load_library=False,
-                              verbose=True)
+    all_imp = (
+        IMPLGEMM_SIMT_PARAMS
+        + IMPLGEMM_VOLTA_PARAMS
+        + IMPLGEMM_TURING_PARAMS
+        + IMPLGEMM_AMPERE_PARAMS
+    )
+    cus = [
+        SpconvOps(),
+        BoxOps(),
+        HashTable(),
+        CompileInfo(),
+        ExternalAllocator(),
+        ExternalSpconvMatmul(),
+        # SimpleExternalSpconvMatmul(),  # for debug, won't be included in release
+        InferenceOps(),
+        PointCloudCompress(),
+    ]
+    pccm.builder.build_pybind(
+        cus,
+        PACKAGE_ROOT / "core_cc",
+        namespace_root=PACKAGE_ROOT,
+        load_library=False,
+        verbose=True,
+    )
 
     # cus_dev: List[pccm.Class] = [
     # ]

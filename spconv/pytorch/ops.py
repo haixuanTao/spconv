@@ -672,41 +672,39 @@ def get_indice_pairs_implicit_gemm(
                 (pair.numel() + 1,), dtype=indice_dtype, device=indices.device
             )
             indice_pairs_uniq_bkp_tv = torch_tensor_to_tv(indice_pairs_uniq_bkp)
-            with timer.record("gen_conv_inds_stage1", stream):
-                SpconvOps.generate_conv_inds_mask_stage1_direct_table(
-                    inds_tv,
-                    hashdata.hashdata_k_tv,
-                    hashdata.hashdata_v_tv,
-                    pair_bwd_tv,
-                    indice_pairs_uniq_bkp_tv,
-                    indice_num_per_loc_tv,
-                    batch_size=batch_size,
-                    output_dims=out_shape,
-                    input_dims=spatial_shape,
-                    ksize=ksize,
-                    stride=stride,
-                    padding=padding,
-                    dilation=dilation,
-                    transposed=transpose,
-                    stream_int=stream,
-                )
+            SpconvOps.generate_conv_inds_mask_stage1_direct_table(
+                inds_tv,
+                hashdata.hashdata_k_tv,
+                hashdata.hashdata_v_tv,
+                pair_bwd_tv,
+                indice_pairs_uniq_bkp_tv,
+                indice_num_per_loc_tv,
+                batch_size=batch_size,
+                output_dims=out_shape,
+                input_dims=spatial_shape,
+                ksize=ksize,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                transposed=transpose,
+                stream_int=stream,
+            )
         else:
-            with timer.record("gen_conv_inds_stage1", stream):
-                SpconvOps.generate_conv_inds_mask_stage1(
-                    inds_tv,
-                    pair_bwd_tv,
-                    indice_pairs_uniq_tv,
-                    indice_num_per_loc_tv,
-                    batch_size=batch_size,
-                    output_dims=out_shape,
-                    input_dims=spatial_shape,
-                    ksize=ksize,
-                    stride=stride,
-                    padding=padding,
-                    dilation=dilation,
-                    transposed=transpose,
-                    stream_int=stream,
-                )
+            SpconvOps.generate_conv_inds_mask_stage1(
+                inds_tv,
+                pair_bwd_tv,
+                indice_pairs_uniq_tv,
+                indice_num_per_loc_tv,
+                batch_size=batch_size,
+                output_dims=out_shape,
+                input_dims=spatial_shape,
+                ksize=ksize,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+                transposed=transpose,
+                stream_int=stream,
+            )
         uniq_out_indices_offset_tv = tv.Tensor()
         with timer.record(f"unique_{indice_pairs_uniq.shape[0]}", stream):
             if direct_table:
