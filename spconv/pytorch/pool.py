@@ -98,6 +98,8 @@ class SparseMaxPool(SparseModule):
 
     def forward(self, input: spconv.SparseConvTensor):
         is_int8 = input.is_quantized
+        if CPU_ONLY_BUILD:
+            input._timer = None
         if is_int8:
             assert self.algo == ConvAlgo.MaskImplicitGemm, "only ConvAlgo.MaskImplicitGemm support int8."
         assert isinstance(input, spconv.SparseConvTensor)
@@ -302,7 +304,8 @@ class SparseAvgPool(SparseModule):
         is_int8 = input.is_quantized
         if is_int8:
             assert self.algo == ConvAlgo.MaskImplicitGemm, "only ConvAlgo.MaskImplicitGemm support int8."
-
+        if CPU_ONLY_BUILD:
+            input._timer = None
         features = input.features
         device = features.device
         indices = input.indices
